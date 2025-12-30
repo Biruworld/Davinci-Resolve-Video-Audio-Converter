@@ -104,3 +104,9 @@ then run
 This is still an early stage, I am so sorry if I made some serious mistakes or maybe even the script. If there anything, please tell me. Thank you so much!
 
 Regards from Asterlusnce.
+
+
+## Authors
+
+- [@asterlusnce](https://github.com/Biruworld)
+
