@@ -51,10 +51,12 @@ These limitations are **known** at this stage.
 
 
 
-## ✅ How to Usage it!
+## ✅ How to Use!
 
 - Make sure to download:
+
 Arch Linux:
+
 ```bash
 sudo pacman -S ffmpeg
 sudo pacman -S yad
