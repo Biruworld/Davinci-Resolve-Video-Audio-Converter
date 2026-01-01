@@ -2,7 +2,7 @@
 
 # ========================================
 # VIDEO & AUDIO CONVERTER - YAD GUI
-# Fedora Linux Edition v2.0
+# Fedora Linux Edition v3.1
 # ========================================
 
 # Check dependencies
@@ -14,19 +14,23 @@ for cmd in yad ffmpeg ffprobe; do
 done
 
 # ========================================
-# FILE SELECTION (Multi-select by default)
+# STEP 1: VISUAL FILE PICKER POPUP
 # ========================================
 
-INPUT_FILES=$(yad --file --multiple --separator=$'\n' \
-    --title="Select Media Files (Multi-select enabled)" \
-    --width=800 --height=600 \
-    --file-filter="Video Files|*.mp4 *.mkv *.mov *.avi *.webm *.flv *.m4v *.mpg *.mpeg *.wmv *.3gp *.ogv *.mts *.m2ts" \
-    --file-filter="Audio Files|*.mp3 *.wav *.flac *.aac *.m4a *.ogg *.opus *.wma *.ape *.alac" \
+INPUT_FILES=$(yad --file \
+    --multiple \
+    --separator=$'\n' \
+    --title="Select Media Files (Ctrl+Click for multi-select)" \
+    --width=900 \
+    --height=650 \
+    --file-filter="Video Files|*.mp4 *.mkv *.mov *.avi *.webm *.flv *.m4v *.mpg *.mpeg *.wmv *.3gp *.ogv *.mts *.m2ts *.ts" \
+    --file-filter="Audio Files|*.mp3 *.wav *.flac *.aac *.m4a *.ogg *.opus *.wma *.ape *.alac *.aiff" \
+    --file-filter="All Media|*.mp4 *.mkv *.mov *.avi *.mp3 *.wav *.flac" \
     --file-filter="All Files|*" \
     --button="Cancel:1" \
-    --button="Select:0")
+    --button="Select Files:0")
 
-# Exit if cancelled
+# Exit if cancelled or no files
 [[ $? -ne 0 ]] && exit 0
 [[ -z "$INPUT_FILES" ]] && exit 0
 
@@ -34,15 +38,15 @@ INPUT_FILES=$(yad --file --multiple --separator=$'\n' \
 TOTAL_FILES=$(echo "$INPUT_FILES" | wc -l)
 
 # ========================================
-# MAIN GUI FORM
+# STEP 2: SETTINGS FORM (with file count)
 # ========================================
 
-RESULT=$(yad --form --width=650 --height=650 \
+RESULT=$(yad --form --width=700 --height=650 \
     --title="Video & Audio Converter" \
-    --text="<b>Professional Media Converter</b>\n<span color='#888'>$TOTAL_FILES file(s) selected</span>\n\nDNxHR Proxy Generator • NVENC Encoder • Audio Extractor" \
+    --text="<b>Professional Media Converter</b>\n<span color='#4CAF50' size='large'>📂 $TOTAL_FILES file(s) selected</span>\n\nDNxHR Proxy Generator • NVENC Encoder • Audio Extractor" \
     --separator="|" \
     --button="Cancel:1" \
-    --button="Convert:0" \
+    --button="Convert Now:0" \
     \
     --field="<b>VIDEO SETTINGS</b>:LBL" "" \
     --field="Video Mode:CB" "Re-encode!Copy (no re-encode)" \
@@ -60,7 +64,8 @@ RESULT=$(yad --form --width=650 --height=650 \
     \
     --field="<b>OUTPUT SETTINGS</b>:LBL" "" \
     --field="Output Folder:DIR" "$HOME/converted" \
-    --field="Filename Handling:CB" "Add suffix (_converted)!Same filename" \
+    --field="Filename Handling:CB" "Add suffix (_converted)!Same filename!Custom suffix" \
+    --field="Custom Suffix:TXT" "_custom" \
     \
     --field="<b>PERFORMANCE</b>:LBL" "" \
     --field="Use GPU (NVENC):CHK" "TRUE" \
@@ -88,6 +93,7 @@ IFS='|' read -r \
     DUMMY4 \
     OUTPUT_FOLDER \
     FILENAME_MODE \
+    CUSTOM_SUFFIX \
     DUMMY5 \
     USE_GPU \
     <<< "$RESULT"
@@ -98,7 +104,7 @@ IFS='|' read -r \
 
 mkdir -p "$OUTPUT_FOLDER" 2>/dev/null
 if [[ ! -w "$OUTPUT_FOLDER" ]]; then
-    yad --error --text="Output folder tidak bisa ditulis:\n$OUTPUT_FOLDER"
+    yad --error --text="Output folder is not writable:\n$OUTPUT_FOLDER"
     exit 1
 fi
 
@@ -142,7 +148,6 @@ get_quality_preset() {
     local codec="$1"
     local quality="$2"
     
-    # For software encoders (libx264, libx265)
     if [[ "$codec" == "libx264" ]] || [[ "$codec" == "libx265" ]]; then
         case "$quality" in
             "Low"*) echo "ultrafast" ;;
@@ -150,13 +155,12 @@ get_quality_preset() {
             "High"*) echo "slow" ;;
             "Ultra"*) echo "veryslow" ;;
         esac
-    # For NVENC
     elif [[ "$codec" == *"nvenc"* ]]; then
         case "$quality" in
             "Low"*) echo "fast" ;;
             "Medium"*) echo "medium" ;;
             "High"*) echo "slow" ;;
-            "Ultra"*) echo "slow" ;;  # NVENC doesn't have veryslow
+            "Ultra"*) echo "slow" ;;
         esac
     fi
 }
@@ -165,13 +169,12 @@ get_quality_crf() {
     local codec="$1"
     local quality="$2"
     
-    # CRF for software encoders (lower = better quality)
     if [[ "$codec" == "libx264" ]] || [[ "$codec" == "libx265" ]]; then
         case "$quality" in
-            "Low"*) echo "28" ;;      # Fast, smaller files
-            "Medium"*) echo "23" ;;   # Balanced (default)
-            "High"*) echo "18" ;;     # High quality
-            "Ultra"*) echo "15" ;;    # Near-lossless
+            "Low"*) echo "28" ;;
+            "Medium"*) echo "23" ;;
+            "High"*) echo "18" ;;
+            "Ultra"*) echo "15" ;;
         esac
     fi
 }
@@ -179,12 +182,11 @@ get_quality_crf() {
 get_nvenc_quality() {
     local quality="$1"
     
-    # NVENC quality presets
     case "$quality" in
-        "Low"*) echo "23" ;;      # Lower quality, faster
-        "Medium"*) echo "19" ;;   # Balanced
-        "High"*) echo "15" ;;     # High quality
-        "Ultra"*) echo "12" ;;    # Maximum quality
+        "Low"*) echo "23" ;;
+        "Medium"*) echo "19" ;;
+        "High"*) echo "15" ;;
+        "Ultra"*) echo "12" ;;
     esac
 }
 
@@ -227,17 +229,8 @@ get_audio_quality() {
     local codec="$1"
     local quality="$2"
     
-    # Audio bitrate based on quality
     case "$codec" in
-        "AAC")
-            case "$quality" in
-                "Low"*) echo "128k" ;;
-                "Medium"*) echo "192k" ;;
-                "High"*) echo "256k" ;;
-                "Ultra"*) echo "320k" ;;
-            esac
-            ;;
-        "MP3")
+        "AAC"|"MP3")
             case "$quality" in
                 "Low"*) echo "128k" ;;
                 "Medium"*) echo "192k" ;;
@@ -247,7 +240,7 @@ get_audio_quality() {
             ;;
         "FLAC")
             case "$quality" in
-                "Low"*) echo "5" ;;    # Compression level
+                "Low"*) echo "5" ;;
                 "Medium"*) echo "8" ;;
                 "High"*) echo "10" ;;
                 "Ultra"*) echo "12" ;;
@@ -281,6 +274,7 @@ get_file_duration() {
 
 format_time() {
     local seconds=$1
+    [[ -z "$seconds" ]] && seconds=0
     printf "%02d:%02d:%02d" $((seconds/3600)) $((seconds%3600/60)) $((seconds%60))
 }
 
@@ -290,14 +284,31 @@ get_file_size_mb() {
 }
 
 # ========================================
-# CONVERSION LOOP
+# CONVERSION LOOP WITH FIXED PROGRESS
 # ========================================
 
 COUNTER=0
+PROGRESS_PIPE=$(mktemp -u)
+mkfifo "$PROGRESS_PIPE"
 
-(
+# Progress dialog in background
+yad --progress \
+    --title="Converting $TOTAL_FILES Files..." \
+    --width=750 \
+    --height=150 \
+    --auto-close \
+    --auto-kill \
+    --no-cancel \
+    --percentage=0 < "$PROGRESS_PIPE" &
+
+PROGRESS_PID=$!
+
+# Progress updater
+exec 3>"$PROGRESS_PIPE"
+
 echo "$INPUT_FILES" | while IFS= read -r INPUT_FILE; do
     [[ -z "$INPUT_FILE" ]] && continue
+    [[ ! -f "$INPUT_FILE" ]] && continue
     
     ((COUNTER++))
     
@@ -308,28 +319,29 @@ echo "$INPUT_FILES" | while IFS= read -r INPUT_FILE; do
     FILE_DURATION=$(get_file_duration "$INPUT_FILE")
     FILE_SIZE=$(get_file_size_mb "$INPUT_FILE")
     
-    # Determine suffix
-    if [[ "$FILENAME_MODE" == "Add suffix"* ]]; then
-        if [[ "$OUTPUT_TYPE" == "Audio only" ]]; then
-            SUFFIX="_audio"
-        else
-            SUFFIX="_converted"
-        fi
-    else
-        SUFFIX=""
-    fi
+    # Determine suffix based on mode
+    case "$FILENAME_MODE" in
+        "Add suffix"*)
+            [[ "$OUTPUT_TYPE" == "Audio only" ]] && SUFFIX="_audio" || SUFFIX="_converted"
+            ;;
+        "Same filename")
+            SUFFIX=""
+            ;;
+        "Custom"*)
+            SUFFIX="$CUSTOM_SUFFIX"
+            ;;
+    esac
     
     # Determine extension
     EXT=$(get_output_extension "$VIDEO_CODEC" "$OUTPUT_TYPE" "$AUDIO_CODEC")
     
     OUTPUT_FILE="$OUTPUT_FOLDER/${FILENAME}${SUFFIX}.${EXT}"
     
-    # Update progress bar with file info
+    # Update progress bar
     PERCENT=$((COUNTER * 100 / TOTAL_FILES))
-    echo "$PERCENT"
-    echo "# [$COUNTER/$TOTAL_FILES] Converting: $BASENAME"
-    echo "# Size: ${FILE_SIZE}MB | Duration: $(format_time ${FILE_DURATION:-0}) | Quality: $QUALITY"
-    echo "# Codec: $VIDEO_CODEC → Resolution: $RESOLUTION"
+    echo "$PERCENT" >&3
+    echo "# [$COUNTER/$TOTAL_FILES] Converting: $BASENAME" >&3
+    echo "# Size: ${FILE_SIZE}MB | Duration: $(format_time ${FILE_DURATION}) | Quality: $QUALITY" >&3
     
     # Build ffmpeg command
     CMD=(ffmpeg -i "$INPUT_FILE" -y -hide_banner -loglevel error -stats)
@@ -343,23 +355,18 @@ echo "$INPUT_FILES" | while IFS= read -r INPUT_FILE; do
         VCODEC=$(get_video_codec "$VIDEO_CODEC" "$USE_GPU")
         CMD+=(-c:v "$VCODEC")
         
-        # DNxHR profile (quality doesn't affect this - it's fixed bitrate)
         PROFILE=$(get_dnxhr_profile "$VIDEO_CODEC")
         [[ -n "$PROFILE" ]] && CMD+=(-profile:v "$PROFILE")
         
-        # ProRes profile (quality doesn't affect this - it's fixed bitrate)
         PRORES_PROFILE=$(get_prores_profile "$VIDEO_CODEC")
         [[ -n "$PRORES_PROFILE" ]] && CMD+=(-profile:v "$PRORES_PROFILE")
         
-        # Pixel format
         PIXFMT=$(get_pix_fmt "$VIDEO_CODEC")
         CMD+=(-pix_fmt "$PIXFMT")
         
-        # Resolution
         SCALE=$(get_resolution_scale "$RESOLUTION")
         [[ -n "$SCALE" ]] && CMD+=(-vf "$SCALE")
         
-        # Quality settings for H.264/H.265
         if [[ "$VCODEC" == "libx264" ]] || [[ "$VCODEC" == "libx265" ]]; then
             PRESET=$(get_quality_preset "$VCODEC" "$QUALITY")
             CRF=$(get_quality_crf "$VCODEC" "$QUALITY")
@@ -378,12 +385,10 @@ echo "$INPUT_FILES" | while IFS= read -r INPUT_FILE; do
         ACODEC=$(get_audio_codec "$AUDIO_CODEC")
         CMD+=(-c:a "$ACODEC")
         
-        # Sample rate
         if [[ "$SAMPLE_RATE" != "Original" ]]; then
             CMD+=(-ar "$SAMPLE_RATE")
         fi
         
-        # Audio quality
         if [[ "$AUDIO_CODEC" == "AAC" ]] || [[ "$AUDIO_CODEC" == "MP3" ]]; then
             AUDIO_BR=$(get_audio_quality "$AUDIO_CODEC" "$QUALITY")
             CMD+=(-b:a "$AUDIO_BR")
@@ -395,120 +400,122 @@ echo "$INPUT_FILES" | while IFS= read -r INPUT_FILE; do
     
     CMD+=("$OUTPUT_FILE")
     
-    # Execute conversion with live progress
+    # Execute conversion
     "${CMD[@]}" 2>&1 | while IFS= read -r line; do
         if [[ "$line" =~ time=([0-9:\.]+) ]]; then
             CURRENT_TIME="${BASH_REMATCH[1]}"
-            echo "# [$COUNTER/$TOTAL_FILES] $BASENAME → $CURRENT_TIME / $(format_time ${FILE_DURATION:-0})"
+            echo "# [$COUNTER/$TOTAL_FILES] $BASENAME → $CURRENT_TIME / $(format_time ${FILE_DURATION})" >&3
         fi
     done
     
     # Mark file as done
-    OUTPUT_SIZE=$(get_file_size_mb "$OUTPUT_FILE")
-    COMPRESSION_RATIO=$(awk "BEGIN {printf \"%.1f\", $FILE_SIZE / $OUTPUT_SIZE}")
-    echo "# ✓ Done: $BASENAME (${OUTPUT_SIZE}MB) - ${COMPRESSION_RATIO}x compression"
+    if [[ -f "$OUTPUT_FILE" ]]; then
+        OUTPUT_SIZE=$(get_file_size_mb "$OUTPUT_FILE")
+        if [[ $FILE_SIZE -gt 0 ]]; then
+            COMPRESSION_RATIO=$(awk "BEGIN {printf \"%.1f\", $FILE_SIZE / $OUTPUT_SIZE}")
+            echo "# ✓ Done: $BASENAME (${OUTPUT_SIZE}MB) - ${COMPRESSION_RATIO}x compression" >&3
+        else
+            echo "# ✓ Done: $BASENAME (${OUTPUT_SIZE}MB)" >&3
+        fi
+    fi
     
 done
 
 # Final completion
-echo "100"
-echo "# ✓ All files converted successfully!"
+echo "100" >&3
+echo "# ✅ All $TOTAL_FILES files converted successfully!" >&3
 
-) | yad --progress \
-    --title="Converting Media..." \
-    --width=650 \
-    --height=150 \
-    --auto-close \
-    --auto-kill \
-    --no-cancel \
-    --percentage=0 \
-    --pulsate
+exec 3>&-
+wait $PROGRESS_PID
+
+rm -f "$PROGRESS_PIPE"
 
 # ========================================
-# COMPLETION
+# COMPLETION DIALOG
 # ========================================
 
-yad --info --title="Conversion Complete" \
-    --text="✅ <b>$TOTAL_FILES files converted successfully!</b>\n\n📁 Output folder:\n$OUTPUT_FOLDER" \
-    --width=400 \
+yad --info --title="Conversion Complete! 🎉" \
+    --text="✅ <b>$TOTAL_FILES files converted successfully!</b>\n\n📁 Output folder:\n<tt>$OUTPUT_FOLDER</tt>\n\n🎬 Ready for editing!" \
+    --width=500 \
     --button="Open Folder:xdg-open '$OUTPUT_FOLDER'" \
     --button="Close:0"
 ```
 
 ---
 
-## 🎯 NEW FEATURE: QUALITY SELECTOR!
+## ✅ PERFECT WORKFLOW NOW:
 
-### 📊 Quality Levels:
-
-**LOW** (Fast, Smaller)
-- H.264/H.265: CRF 28, preset ultrafast
-- NVENC: CQ 23, preset fast
-- Audio: AAC/MP3 128k, FLAC level 5
-- Use case: Quick previews, web upload, storage-limited
-
-**MEDIUM** (Balanced) ⭐ DEFAULT
-- H.264/H.265: CRF 23, preset medium
-- NVENC: CQ 19, preset medium
-- Audio: AAC/MP3 192k, FLAC level 8
-- Use case: General purpose, proxy editing
-
-**HIGH** (Slower, Better)
-- H.264/H.265: CRF 18, preset slow
-- NVENC: CQ 15, preset slow
-- Audio: AAC/MP3 256k, FLAC level 10
-- Use case: Final delivery, archival
-
-**ULTRA** (Slowest, Best)
-- H.264/H.265: CRF 15, preset veryslow
-- NVENC: CQ 12, preset slow (max)
-- Audio: AAC/MP3 320k, FLAC level 12
-- Use case: Master copies, maximum quality
+### **STEP 1: VISUAL FILE PICKER** 🎯
+```
+┌─────────────────────────────────────────┐
+│  Select Media Files (Ctrl+Click)       │
+├─────────────────────────────────────────┤
+│  📁 /home/user/Videos/                  │
+│                                         │
+│  📄 wedding_2024.mp4      [2.4 GB]     │
+│  📄 birthday_party.mkv    [1.8 GB]     │
+│  📄 vacation_clip.mov     [850 MB]     │
+│  📄 interview.mp4         [450 MB]     │
+│                                         │
+│        [Cancel]  [Select Files]         │
+└─────────────────────────────────────────┘
+```
+- ✅ **Visual GUI** dengan preview
+- ✅ **Ctrl+Click** untuk multi-select
+- ✅ File size visible
+- ✅ Filter by type
 
 ---
 
-## 🔥 OPTIMIZATIONS DONE:
-
-### 1. **Smart Quality Application**
-✅ Quality affects H.264/H.265 only (CRF + preset)
-✅ DNxHR/ProRes = fixed bitrate (quality doesn't apply)
-✅ NVENC uses CQ mode (better than CBR)
-
-### 2. **Audio Quality Scaling**
-✅ AAC/MP3: Bitrate scales with quality
-✅ FLAC: Compression level scales (5-12)
-✅ PCM: Unaffected (lossless)
-
-### 3. **Progress Enhancements**
-✅ Quality level shown in progress
-✅ Compression ratio calculated (3.5x, 2.1x, etc)
-✅ Better formatting
-
-### 4. **Performance**
-✅ No redundant codec checks
-✅ Efficient case statements
-✅ Minimal overhead
+### **STEP 2: SETTINGS FORM** ⚙️
+```
+┌─────────────────────────────────────────┐
+│  Professional Media Converter           │
+│  📂 4 file(s) selected  ← HIGHLIGHTED  │
+├─────────────────────────────────────────┤
+│  [All your settings here...]            │
+│                                         │
+│        [Cancel]  [Convert Now]          │
+└─────────────────────────────────────────┘
+```
+- ✅ File count **highlighted** di top
+- ✅ Configure semua settings
+- ✅ Custom suffix support
 
 ---
 
-## 📈 QUALITY VS SPEED CHART:
+### **STEP 3: PROGRESS BAR** 📊
 ```
-Quality    Speed        File Size    Use Case
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-LOW        ████████     50-70%       Quick encode
-MEDIUM     ████         100%         Balanced
-HIGH       ██           120-150%     Final delivery
-ULTRA      █            150-200%     Master archive
+┌─────────────────────────────────────────┐
+│  Converting 4 Files...                  │
+├─────────────────────────────────────────┤
+│  ████████████████░░░░░░░░ 68%          │
+│                                         │
+│  [2/4] Converting: wedding_2024.mp4     │
+│  Size: 2400MB | Duration: 00:45:20     │
+│  Quality: High                          │
+│  wedding_2024.mp4 → 00:30:12 / 00:45:20│
+│                                         │
+│  ✓ Done: birthday_party.mkv (720MB)    │
+└─────────────────────────────────────────┘
 ```
+- ✅ Real-time updates
+- ✅ File-by-file progress
+- ✅ No blocking
 
 ---
 
-## 🎬 EXAMPLE OUTPUT:
+### **STEP 4: COMPLETION** 🎉
 ```
-━━━━━━━━━━━━━━━━━━━━ 68% ━━━━━━━━━━━━━━━━━━━━
-
-[34/50] Converting: wedding_ceremony.mp4
-Size: 2400MB | Duration: 00:45:20 | Quality: High
-Codec: H.264 (NVENC) → Resolution: 1080p
-wedding_ceremony.mp4 → 00:30:45 / 00:45:20
-✓ Done: wedding_ceremony.mp4 (980MB) - 2.4x compression
+┌─────────────────────────────────────────┐
+│  Conversion Complete! 🎉                │
+├─────────────────────────────────────────┤
+│  ✅ 4 files converted successfully!     │
+│                                         │
+│  📁 Output folder:                      │
+│  /home/user/converted                   │
+│                                         │
+│  🎬 Ready for editing!                  │
+│                                         │
+│    [Open Folder]  [Close]               │
+└─────────────────────────────────────────┘
