@@ -55,7 +55,7 @@ These limitations are **known** at this stage.
 
 - Make sure to download:
 
-Arch Linux:
+Linux (i think any distro):
 
 ```bash
 git clone https://github.com/Biruworld/Davinci-Resolve-Video-Audio-Converter
