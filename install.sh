@@ -7,7 +7,7 @@
 
 set -e  # Exit immediately on error
 
-SCRIPT_NAME="converter.sh"
+SCRIPT_NAME="video-converter.sh"
 INSTALL_NAME="davinci-converter"
 INSTALL_PATH="/usr/local/bin/$INSTALL_NAME"
 
