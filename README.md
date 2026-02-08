@@ -22,7 +22,7 @@ This tool provides a **mininal GUI** to:
 
 ---
 ## 🧰 Tools Used
-- Shell script ('sh') (**for now**)
+- Shell script (bash) (**for now**)
 - YAD (Yet Another Dialog)
 - FFmpeg
 
@@ -58,50 +58,15 @@ These limitations are **known** at this stage.
 Arch Linux:
 
 ```bash
-sudo pacman -S ffmpeg
-sudo pacman -S yad
+git clone https://github.com/Biruworld/Davinci-Resolve-Video-Audio-Converter
+cd Davinci-Resolve-Video-Audio-Converter
+chmod x+ install.sh
+./install.sh
 ```
-After that download the script above, and save as script.sh
-
-⚠️ Don't forget the directories for example, you've downloaded it and put it on Download
+How to Run?
 ```bash
-cd /home/---/Downloads/
+davinci-resolve
 ```
-and then
-
-```bash
-sudo chmod +x script.sh
-```
-
-then run
-```bash
-./script.sh
-```
----
-
-Fedora Linux
-
-```bash
-sudo dnf install ffmpeg
-sudo dnf install yad
-```
-⚠️ Don't forget the directories for example, you've downloaded it and put it on Download
-```bash
-cd /home/---/Downloads/
-```
-and then
-
-```bash
-sudo chmod +x script.sh
-```
-
-then run
-```bash
-./script.sh
-```
-
----
-
 ## ⚠️ Caution
 This is still an early stage, I am so sorry if I made some serious mistakes or maybe even the script. If there anything, please tell me. Thank you so much!
 
