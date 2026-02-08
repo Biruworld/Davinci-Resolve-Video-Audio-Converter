@@ -60,7 +60,7 @@ Linux (i think any distro):
 ```bash
 git clone https://github.com/Biruworld/Davinci-Resolve-Video-Audio-Converter
 cd Davinci-Resolve-Video-Audio-Converter
-chmod x+ install.sh
+chmod +x install.sh
 ./install.sh
 ```
 How to Run?
