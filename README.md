@@ -56,6 +56,7 @@ These limitations are **known** at this stage.
 - Make sure to download:
 
 Linux (i think any distro):
+(works on Arch Linux, Fedora)
 
 ```bash
 git clone https://github.com/Biruworld/Davinci-Resolve-Video-Audio-Converter
@@ -68,7 +69,7 @@ How to Run?
 davinci-resolve
 ```
 ## ⚠️ Caution
-This is still an early stage, I am so sorry if I made some serious mistakes or maybe even the script. If there anything, please tell me. Thank you so much!
+This is still an early stage, I am apologize if I made some serious mistakes or maybe even the script. If there anything, please tell me. Thank you so much!
 
 Regards from Asterlusnce.
 
