@@ -22,12 +22,12 @@ This tool provides a **mininal GUI** to:
 
 ---
 ## 🧰 Tools Used
-- Shell script (bash) (**for now**)
-- YAD (Yet Another Dialog)
+- Python
+- GTK4
 - FFmpeg
 
 ## 📦 Features (Current)
-- GUI file picker (YAD)
+- GUI file picker (GTK4)
 - Preset-based conversion for Davinci Resolve
 - Focused output formats:
     - DNxHR
@@ -45,9 +45,8 @@ These limitations are **known** at this stage.
 
 ---
 ## ⏩ Future Plan
-- [] Turned it into Python based instead of Shell.
 - [] Package as a Flatpak.
-- [] Replace YAD with a native Python GUI (GTK or Qt)
+- Recompile, remaking it.
 
 
 
@@ -55,8 +54,7 @@ These limitations are **known** at this stage.
 
 - Make sure to download:
 
-Linux (i think any distro):
-(works on Arch Linux, Fedora)
+Linux:
 
 ```bash
 git clone https://github.com/Biruworld/Davinci-Resolve-Video-Audio-Converter
