@@ -1,671 +1,866 @@
-#!/bin/bash
-# Cleanup function
-PROGRESS_PIPE=""
-PROGRESS_PID=""
-CANCEL_FLAG="/tmp/davinci_converter_cancel_$$"
+#!/usr/bin/env python3
+"""
+DaVinci Converter — GTK4 / libadwaita edition
+A native rewrite of the yad-based bash converter: same ffmpeg presets
+(DNxHR / ProRes proxies, NVENC, plain audio extraction) but as a real
+Adwaita app instead of a chain of yad dialogs.
 
-cleanup() {
-    exec 3>&- 2>/dev/null
-    [[ -n "$PROGRESS_PID" ]] && kill $PROGRESS_PID 2>/dev/null
-    rm -f "$PROGRESS_PIPE" "$CANCEL_FLAG" 2>/dev/null
+Dependencies (Arch):
+    sudo pacman -S python-gobject gtk4 libadwaita ffmpeg
+"""
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+from gi.repository import Gtk, Adw, GLib, Gio
+
+import os
+import re
+import json
+import shutil
+import subprocess
+import threading
+import datetime
+
+APP_ID = "sh.asterlusnce.davinciconverter"
+
+CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "davinci-converter")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(data):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+# --------------------------------------------------------------------------
+# Static option lists (kept identical to the original yad --field choices
+# so presets / muscle memory carry over 1:1)
+# --------------------------------------------------------------------------
+
+PRESETS = [
+    "Custom",
+    "DaVinci Proxy (Fast)",
+    "DaVinci Proxy (Quality)",
+    "Audio Extract Only",
+    "YouTube Upload (H.264)",
+]
+VIDEO_MODES = ["Re-encode", "Copy (no re-encode)"]
+RESOLUTIONS = ["Original", "1080p", "720p", "540p", "360p", "240p", "144p"]
+VIDEO_CODECS = [
+    "DNxHR LB (Proxy - Recommended)",
+    "DNxHR SQ",
+    "DNxHR HQ ⚠ Heavy",
+    "ProRes Proxy",
+    "ProRes 422 ⚠ Heavy",
+    "H.264 (Software)",
+    "H.264 (NVENC)",
+    "H.265 (NVENC)",
+]
+QUALITIES = [
+    "Medium (Balanced)",
+    "Low (Fast, Smaller)",
+    "High (Slower, Better)",
+    "Ultra (Slowest, Best)",
+]
+AUDIO_CODECS = ["PCM 16-bit", "PCM 24-bit", "FLAC", "AAC", "MP3"]
+SAMPLE_RATES = ["Original", "48000", "44100"]
+OUTPUT_TYPES = ["Video + Audio", "Video only", "Audio only"]
+FILENAME_MODES = ["Add suffix (_converted)", "Same filename", "Custom suffix"]
+
+PRESET_OVERRIDES = {
+    "DaVinci Proxy (Fast)": {
+        "video_codec": "DNxHR LB (Proxy - Recommended)",
+        "resolution": "540p",
+        "quality": "Low (Fast, Smaller)",
+        "output_type": "Video + Audio",
+    },
+    "DaVinci Proxy (Quality)": {
+        "video_codec": "DNxHR SQ",
+        "resolution": "1080p",
+        "quality": "Medium (Balanced)",
+        "output_type": "Video + Audio",
+    },
+    "Audio Extract Only": {
+        "output_type": "Audio only",
+        "audio_codec": "FLAC",
+        "sample_rate": "48000",
+    },
+    "YouTube Upload (H.264)": {
+        "video_codec": "H.264 (Software)",
+        "resolution": "1080p",
+        "quality": "High (Slower, Better)",
+        "audio_codec": "AAC",
+        "output_type": "Video + Audio",
+    },
 }
 
-trap cleanup EXIT INT TERM
 
-# Check dependencies
-for cmd in yad ffmpeg ffprobe; do
-    if ! command -v $cmd &> /dev/null; then
-        zenity --error --text="Required: $cmd\n\nInstall:\nFedora: sudo dnf install $cmd\nArch: sudo pacman -S $cmd\nUbuntu: sudo apt install $cmd"
-        exit 1
-    fi
-done
+# --------------------------------------------------------------------------
+# ffmpeg mapping helpers — direct ports of the bash case statements
+# --------------------------------------------------------------------------
 
-# ========================================
-# GPU CAPABILITY CHECK
-# ========================================
+def q_word(quality):
+    """'Low (Fast, Smaller)' -> 'Low'"""
+    return quality.split(" ")[0]
 
-check_nvenc_support() {
-    if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "h264_nvenc"; then
-        return 1
-    fi
-    return 0
-}
 
-HAS_NVENC=false
-if check_nvenc_support; then
-    HAS_NVENC=true
-fi
+def get_resolution_scale(res):
+    return {
+        "Original": "",
+        "1080p": "scale=-2:1080",
+        "720p": "scale=-2:720",
+        "540p": "scale=-2:540",
+        "360p": "scale=-2:360",
+        "240p": "scale=-2:240",
+        "144p": "scale=-2:144",
+    }.get(res, "")
 
-# ========================================
-# STEP 1: VISUAL FILE PICKER POPUP
-# ========================================
 
-INPUT_FILES=$(yad --file \
-    --multiple \
-    --separator=$'\n' \
-    --title="Select Media Files (Ctrl+Click for multi-select)" \
-    --width=900 \
-    --height=650 \
-    --file-filter="Video Files|*.mp4 *.mkv *.mov *.avi *.webm *.flv *.m4v *.mpg *.mpeg *.wmv *.3gp *.ogv *.mts *.m2ts *.ts" \
-    --file-filter="Audio Files|*.mp3 *.wav *.flac *.aac *.m4a *.ogg *.opus *.wma *.ape *.alac *.aiff" \
-    --file-filter="All Media|*.mp4 *.mkv *.mov *.avi *.mp3 *.wav *.flac" \
-    --file-filter="All Files|*" \
-    --button="Cancel:1" \
-    --button="Select Files:0")
+def get_video_codec_name(video_codec, use_gpu):
+    if video_codec.startswith("DNxHR"):
+        return "dnxhd"
+    if video_codec.startswith("ProRes"):
+        return "prores_ks"
+    if video_codec.startswith("H.264 (NVENC)"):
+        return "h264_nvenc" if use_gpu else "libx264"
+    if video_codec.startswith("H.264 (Software)"):
+        return "libx264"
+    if video_codec.startswith("H.265 (NVENC)"):
+        return "hevc_nvenc" if use_gpu else "libx265"
+    return "libx264"
 
-# Exit if cancelled or no files
-[[ $? -ne 0 ]] && exit 0
-[[ -z "$INPUT_FILES" ]] && exit 0
 
-# Count files
-TOTAL_FILES=$(echo "$INPUT_FILES" | wc -l)
+def get_quality_preset(codec, quality):
+    q = q_word(quality)
+    if codec in ("libx264", "libx265"):
+        return {"Low": "ultrafast", "Medium": "medium", "High": "slow", "Ultra": "veryslow"}[q]
+    if "nvenc" in codec:
+        return {"Low": "fast", "Medium": "medium", "High": "slow", "Ultra": "slow"}[q]
+    return None
 
-# ========================================
-# STEP 2: SETTINGS FORM (with file count)
-# ========================================
 
-# Build GPU warning message
-GPU_STATUS="✅ NVENC Available"
-if [[ "$HAS_NVENC" == false ]]; then
-    GPU_STATUS="⚠️ NVENC Not Detected (will use CPU encoding)"
-fi
+def get_quality_crf(codec, quality):
+    q = q_word(quality)
+    if codec in ("libx264", "libx265"):
+        return {"Low": "28", "Medium": "23", "High": "18", "Ultra": "15"}[q]
+    return None
 
-RESULT=$(yad --form --width=700 --height=750 \
-    --title="Video & Audio Converter v3.2" \
-    --text="<b>Professional Media Converter</b>\n<span color='#4CAF50' size='large'>📂 $TOTAL_FILES file(s) selected</span>\n<span color='#FF9800' size='small'>$GPU_STATUS</span>\n\nDNxHR Proxy Generator • NVENC Encoder • Audio Extractor" \
-    --separator="|" \
-    --button="Cancel:1" \
-    --button="Convert Now:0" \
-    \
-    --field="<b>QUICK PRESETS</b>:LBL" "" \
-    --field="Load Preset:CB" "Custom!DaVinci Proxy (Fast)!DaVinci Proxy (Quality)!Audio Extract Only!YouTube Upload (H.264)" \
-    \
-    --field="<b>VIDEO SETTINGS</b>:LBL" "" \
-    --field="Video Mode:CB" "Re-encode!Copy (no re-encode)" \
-    --field="Resolution:CB" "Original!1080p!720p!540p!360p!240p!144p" \
-    --field="Video Codec:CB" "DNxHR LB (Proxy - Recommended)!DNxHR SQ!DNxHR HQ ⚠ Heavy!ProRes Proxy!ProRes 422 ⚠ Heavy!H.264 (Software)!H.264 (NVENC)!H.265 (NVENC)" \
-    --field="Quality:CB" "Medium (Balanced)!Low (Fast, Smaller)!High (Slower, Better)!Ultra (Slowest, Best)" \
-    \
-    --field="<b>AUDIO SETTINGS</b>:LBL" "" \
-    --field="Convert Audio:CHK" "TRUE" \
-    --field="Audio Codec:CB" "PCM 16-bit!PCM 24-bit!FLAC!AAC!MP3" \
-    --field="Sample Rate:CB" "Original!48000!44100" \
-    \
-    --field="<b>OUTPUT MODE</b>:LBL" "" \
-    --field="Output Type:CB" "Video + Audio!Video only!Audio only" \
-    \
-    --field="<b>OUTPUT SETTINGS</b>:LBL" "" \
-    --field="Output Folder:DIR" "$HOME/converted" \
-    --field="Filename Handling:CB" "Add suffix (_converted)!Same filename!Custom suffix" \
-    --field="Custom Suffix:TXT" "_custom" \
-    --field="Overwrite existing files:CHK" "FALSE" \
-    \
-    --field="<b>ADVANCED</b>:LBL" "" \
-    --field="Use GPU (NVENC):CHK" "$HAS_NVENC" \
-    --field="Dry-run (preview commands only):CHK" "FALSE" \
-)
 
-# Exit if cancelled
-[[ $? -ne 0 ]] && exit 0
+def get_nvenc_quality(quality):
+    q = q_word(quality)
+    return {"Low": "23", "Medium": "19", "High": "15", "Ultra": "12"}[q]
 
-# ========================================
-# PARSE FORM RESULTS
-# ========================================
 
-IFS='|' read -r \
-    DUMMY1 \
-    PRESET \
-    DUMMY2 \
-    VIDEO_MODE \
-    RESOLUTION \
-    VIDEO_CODEC \
-    QUALITY \
-    DUMMY3 \
-    CONVERT_AUDIO \
-    AUDIO_CODEC \
-    SAMPLE_RATE \
-    DUMMY4 \
-    OUTPUT_TYPE \
-    DUMMY5 \
-    OUTPUT_FOLDER \
-    FILENAME_MODE \
-    CUSTOM_SUFFIX \
-    OVERWRITE_FILES \
-    DUMMY6 \
-    USE_GPU \
-    DRY_RUN \
-    <<< "$RESULT"
+def get_dnxhr_profile(video_codec):
+    if video_codec.startswith("DNxHR LB"):
+        return "dnxhr_lb"
+    if video_codec.startswith("DNxHR SQ"):
+        return "dnxhr_sq"
+    if video_codec.startswith("DNxHR HQ"):
+        return "dnxhr_hq"
+    return None
 
-# Apply preset if selected
-if [[ "$PRESET" != "Custom" ]]; then
-    case "$PRESET" in
-        "DaVinci Proxy (Fast)")
-            VIDEO_CODEC="DNxHR LB (Proxy - Recommended)"
-            RESOLUTION="540p"
-            QUALITY="Low (Fast, Smaller)"
-            OUTPUT_TYPE="Video + Audio"
-            ;;
-        "DaVinci Proxy (Quality)")
-            VIDEO_CODEC="DNxHR SQ"
-            RESOLUTION="1080p"
-            QUALITY="Medium (Balanced)"
-            OUTPUT_TYPE="Video + Audio"
-            ;;
-        "Audio Extract Only")
-            OUTPUT_TYPE="Audio only"
-            AUDIO_CODEC="FLAC"
-            SAMPLE_RATE="48000"
-            ;;
-        "YouTube Upload (H.264)")
-            VIDEO_CODEC="H.264 (Software)"
-            RESOLUTION="1080p"
-            QUALITY="High (Slower, Better)"
-            AUDIO_CODEC="AAC"
-            OUTPUT_TYPE="Video + Audio"
-            ;;
-    esac
-fi
 
-# Warn if NVENC selected but not available
-if [[ "$VIDEO_CODEC" == *"NVENC"* ]] && [[ "$HAS_NVENC" == false ]]; then
-    yad --warning \
-        --text="⚠️ NVENC encoder not available!\n\nYour system doesn't support NVIDIA hardware encoding.\nFalling back to software encoding (slower)." \
-        --button="Continue:0" \
-        --button="Cancel:1"
-    [[ $? -ne 0 ]] && exit 0
-    USE_GPU="FALSE"
-fi
+def get_prores_profile(video_codec):
+    if video_codec.startswith("ProRes Proxy"):
+        return "0"
+    if video_codec.startswith("ProRes 422"):
+        return "2"
+    return None
 
-# ========================================
-# VALIDATION
-# ========================================
 
-mkdir -p "$OUTPUT_FOLDER" 2>/dev/null
-if [[ ! -w "$OUTPUT_FOLDER" ]]; then
-    yad --error --text="Output folder is not writable:\n$OUTPUT_FOLDER"
-    exit 1
-fi
+def get_pix_fmt(video_codec):
+    return "yuv422p" if video_codec.startswith(("DNxHR", "ProRes")) else "yuv420p"
 
-# ========================================
-# HELPER FUNCTIONS
-# ========================================
 
-get_resolution_scale() {
-    case "$1" in
-        "Original") echo "" ;;
-        "1080p") echo "scale=-2:1080" ;;
-        "720p") echo "scale=-2:720" ;;
-        "540p") echo "scale=-2:540" ;;
-        "360p") echo "scale=-2:360" ;;
-        "240p") echo "scale=-2:240" ;;
-        "144p") echo "scale=-2:144" ;;
-    esac
-}
+def get_audio_codec_name(audio_codec):
+    return {
+        "PCM 16-bit": "pcm_s16le",
+        "PCM 24-bit": "pcm_s24le",
+        "FLAC": "flac",
+        "AAC": "aac",
+        "MP3": "libmp3lame",
+    }[audio_codec]
 
-get_video_codec() {
-    local codec="$1"
-    local use_gpu="$2"
-    
-    case "$codec" in
-        "DNxHR LB"*) echo "dnxhd" ;;
-        "DNxHR SQ"*) echo "dnxhd" ;;
-        "DNxHR HQ"*) echo "dnxhd" ;;
-        "ProRes Proxy"*) echo "prores_ks" ;;
-        "ProRes 422"*) echo "prores_ks" ;;
-        "H.264 (NVENC)"*) 
-            [[ "$use_gpu" == "TRUE" ]] && echo "h264_nvenc" || echo "libx264"
-            ;;
-        "H.264 (Software)"*) echo "libx264" ;;
-        "H.265 (NVENC)"*)
-            [[ "$use_gpu" == "TRUE" ]] && echo "hevc_nvenc" || echo "libx265"
-            ;;
-    esac
-}
 
-get_quality_preset() {
-    local codec="$1"
-    local quality="$2"
-    
-    if [[ "$codec" == "libx264" ]] || [[ "$codec" == "libx265" ]]; then
-        case "$quality" in
-            "Low"*) echo "ultrafast" ;;
-            "Medium"*) echo "medium" ;;
-            "High"*) echo "slow" ;;
-            "Ultra"*) echo "veryslow" ;;
-        esac
-    elif [[ "$codec" == *"nvenc"* ]]; then
-        case "$quality" in
-            "Low"*) echo "fast" ;;
-            "Medium"*) echo "medium" ;;
-            "High"*) echo "slow" ;;
-            "Ultra"*) echo "slow" ;;
-        esac
-    fi
-}
+def get_audio_quality(audio_codec, quality):
+    q = q_word(quality)
+    if audio_codec in ("AAC", "MP3"):
+        return {"Low": "128k", "Medium": "192k", "High": "256k", "Ultra": "320k"}[q]
+    if audio_codec == "FLAC":
+        return {"Low": "5", "Medium": "8", "High": "10", "Ultra": "12"}[q]
+    return None
 
-get_quality_crf() {
-    local codec="$1"
-    local quality="$2"
-    
-    if [[ "$codec" == "libx264" ]] || [[ "$codec" == "libx265" ]]; then
-        case "$quality" in
-            "Low"*) echo "28" ;;
-            "Medium"*) echo "23" ;;
-            "High"*) echo "18" ;;
-            "Ultra"*) echo "15" ;;
-        esac
-    fi
-}
 
-get_nvenc_quality() {
-    local quality="$1"
-    
-    case "$quality" in
-        "Low"*) echo "23" ;;
-        "Medium"*) echo "19" ;;
-        "High"*) echo "15" ;;
-        "Ultra"*) echo "12" ;;
-    esac
-}
+def get_output_extension(video_codec, output_type, audio_codec):
+    if output_type == "Audio only":
+        if audio_codec.startswith("PCM"):
+            return "wav"
+        return {"FLAC": "flac", "AAC": "m4a", "MP3": "mp3"}.get(audio_codec, "flac")
+    if "DNxHR" in video_codec or "ProRes" in video_codec:
+        return "mov"
+    return "mp4"
 
-get_dnxhr_profile() {
-    case "$1" in
-        "DNxHR LB"*) echo "dnxhr_lb" ;;
-        "DNxHR SQ"*) echo "dnxhr_sq" ;;
-        "DNxHR HQ"*) echo "dnxhr_hq" ;;
-        *) echo "" ;;
-    esac
-}
 
-get_prores_profile() {
-    case "$1" in
-        "ProRes Proxy"*) echo "0" ;;
-        "ProRes 422"*) echo "2" ;;
-        *) echo "" ;;
-    esac
-}
+def get_suffix(filename_mode, output_type, custom_suffix):
+    if filename_mode.startswith("Add suffix"):
+        return "_audio" if output_type == "Audio only" else "_converted"
+    if filename_mode.startswith("Same filename"):
+        return ""
+    return custom_suffix
 
-get_pix_fmt() {
-    local codec="$1"
-    case "$codec" in
-        "DNxHR"*|"ProRes"*) echo "yuv422p" ;;
-        *) echo "yuv420p" ;;
-    esac
-}
 
-get_audio_codec() {
-    case "$1" in
-        "PCM 16-bit") echo "pcm_s16le" ;;
-        "PCM 24-bit") echo "pcm_s24le" ;;
-        "FLAC") echo "flac" ;;
-        "AAC") echo "aac" ;;
-        "MP3") echo "libmp3lame" ;;
-    esac
-}
+def get_file_duration(path):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        return int(float(out))
+    except Exception:
+        return 0
 
-get_audio_quality() {
-    local codec="$1"
-    local quality="$2"
-    
-    case "$codec" in
-        "AAC"|"MP3")
-            case "$quality" in
-                "Low"*) echo "128k" ;;
-                "Medium"*) echo "192k" ;;
-                "High"*) echo "256k" ;;
-                "Ultra"*) echo "320k" ;;
-            esac
-            ;;
-        "FLAC")
-            case "$quality" in
-                "Low"*) echo "5" ;;
-                "Medium"*) echo "8" ;;
-                "High"*) echo "10" ;;
-                "Ultra"*) echo "12" ;;
-            esac
-            ;;
-    esac
-}
 
-get_output_extension() {
-    local vcodec="$1"
-    local output_type="$2"
-    local acodec="$3"
-    
-    if [[ "$output_type" == "Audio only" ]]; then
-        case "$acodec" in
-            "PCM"*) echo "wav" ;;
-            "FLAC") echo "flac" ;;
-            "AAC") echo "m4a" ;;
-            "MP3") echo "mp3" ;;
-        esac
-    elif [[ "$vcodec" == *"DNxHR"* ]] || [[ "$vcodec" == *"ProRes"* ]]; then
-        echo "mov"
-    else
-        echo "mp4"
-    fi
-}
+def format_time(seconds):
+    seconds = int(seconds or 0)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
-get_file_duration() {
-    ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | cut -d. -f1
-}
 
-format_time() {
-    local seconds=$1
-    [[ -z "$seconds" ]] && seconds=0
-    printf "%02d:%02d:%02d" $((seconds/3600)) $((seconds%3600/60)) $((seconds%60))
-}
+def get_file_size_mb(path):
+    try:
+        return os.path.getsize(path) // 1048576
+    except OSError:
+        return 0
 
-get_file_size_mb() {
-    local size_bytes=$(stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null)
-    [[ -z "$size_bytes" ]] && echo "0" || echo $(( size_bytes / 1048576 ))
-}
 
-# ========================================
-# DRY RUN MODE
-# ========================================
+def check_nvenc_support():
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        return "h264_nvenc" in out
+    except Exception:
+        return False
 
-if [[ "$DRY_RUN" == "TRUE" ]]; then
-    PLAN_FILE="$OUTPUT_FOLDER/conversion_plan_$(date +%Y%m%d_%H%M%S).txt"
-    
-    {
-        echo "========================================="
-        echo "  DAVINCI CONVERTER - DRY RUN"
-        echo "========================================="
-        echo "Date: $(date)"
-        echo "Total files: $TOTAL_FILES"
-        echo ""
-        echo "Settings:"
-        echo "  Video: $VIDEO_CODEC | $RESOLUTION | $QUALITY"
-        echo "  Audio: $AUDIO_CODEC | $SAMPLE_RATE"
-        echo "  Output: $OUTPUT_TYPE"
-        echo "  GPU: $USE_GPU"
-        echo ""
-        echo "========================================="
-        echo "Commands to be executed:"
-        echo "========================================="
-        echo ""
-    } > "$PLAN_FILE"
-    
-    echo "$INPUT_FILES" | while IFS= read -r INPUT_FILE; do
-        [[ -z "$INPUT_FILE" ]] && continue
-        [[ ! -f "$INPUT_FILE" ]] && continue
-        
-        BASENAME=$(basename "$INPUT_FILE")
-        FILENAME="${BASENAME%.*}"
-        
-        case "$FILENAME_MODE" in
-            "Add suffix"*)
-                [[ "$OUTPUT_TYPE" == "Audio only" ]] && SUFFIX="_audio" || SUFFIX="_converted"
-                ;;
-            "Same filename") SUFFIX="" ;;
-            "Custom"*) SUFFIX="$CUSTOM_SUFFIX" ;;
-        esac
-        
-        EXT=$(get_output_extension "$VIDEO_CODEC" "$OUTPUT_TYPE" "$AUDIO_CODEC")
-        OUTPUT_FILE="$OUTPUT_FOLDER/${FILENAME}${SUFFIX}.${EXT}"
-        
-        echo "# File: $BASENAME" >> "$PLAN_FILE"
-        echo "# Output: $(basename "$OUTPUT_FILE")" >> "$PLAN_FILE"
-        echo "ffmpeg -i \"$INPUT_FILE\" [encoding parameters...] \"$OUTPUT_FILE\"" >> "$PLAN_FILE"
-        echo "" >> "$PLAN_FILE"
-    done
-    
-    yad --text-info \
-        --title="Dry Run - Preview Commands" \
-        --width=800 \
-        --height=600 \
-        --filename="$PLAN_FILE" \
-        --button="Save Plan:0" \
-        --button="Close:1"
-    
-    exit 0
-fi
 
-# ========================================
-# CONVERSION LOOP WITH ENHANCED PROGRESS
-# ========================================
+def build_ffmpeg_cmd(input_file, output_file, s):
+    """s = settings dict (see ConverterWindow.gather_settings)"""
+    cmd = ["ffmpeg", "-i", input_file, "-y", "-hide_banner", "-loglevel", "error", "-stats"]
 
-COUNTER=0
-SUCCESS_COUNT=0
-FAILED_COUNT=0
-SKIPPED_COUNT=0
-START_TIME=$(date +%s)
+    if s["output_type"] == "Audio only":
+        cmd += ["-vn"]
+    elif s["video_mode"].startswith("Copy"):
+        cmd += ["-c:v", "copy"]
+    else:
+        vcodec = get_video_codec_name(s["video_codec"], s["use_gpu"])
+        cmd += ["-c:v", vcodec]
 
-PROGRESS_PIPE=$(mktemp -u)
-mkfifo "$PROGRESS_PIPE"
+        profile = get_dnxhr_profile(s["video_codec"])
+        if profile:
+            cmd += ["-profile:v", profile]
 
-# Progress dialog in background
-yad --progress \
-    --title="Converting $TOTAL_FILES Files..." \
-    --width=750 \
-    --height=150 \
-    --auto-close \
-    --auto-kill \
-    --percentage=0 \
-    --button="Cancel:1" < "$PROGRESS_PIPE" &
+        prores_profile = get_prores_profile(s["video_codec"])
+        if prores_profile:
+            cmd += ["-profile:v", prores_profile]
 
-PROGRESS_PID=$!
+        cmd += ["-pix_fmt", get_pix_fmt(s["video_codec"])]
 
-# Progress updater
-exec 3>"$PROGRESS_PIPE"
+        scale = get_resolution_scale(s["resolution"])
+        if scale:
+            cmd += ["-vf", scale]
 
-# Create log file
-LOG_FILE="$OUTPUT_FOLDER/conversion_log_$(date +%Y%m%d_%H%M%S).txt"
-{
-    echo "========================================="
-    echo "  DAVINCI CONVERTER LOG"
-    echo "========================================="
-    echo "Date: $(date)"
-    echo "Total files: $TOTAL_FILES"
-    echo ""
-    echo "Settings:"
-    echo "  Video: $VIDEO_CODEC | $RESOLUTION | $QUALITY"
-    echo "  Audio: $AUDIO_CODEC | $SAMPLE_RATE"
-    echo "  Output: $OUTPUT_TYPE"
-    echo "  GPU: $USE_GPU"
-    echo ""
-    echo "========================================="
-    echo ""
-} > "$LOG_FILE"
+        if vcodec in ("libx264", "libx265"):
+            cmd += ["-preset", get_quality_preset(vcodec, s["quality"]),
+                    "-crf", get_quality_crf(vcodec, s["quality"])]
+        elif "nvenc" in vcodec:
+            cmd += ["-preset", get_quality_preset(vcodec, s["quality"]),
+                    "-cq", get_nvenc_quality(s["quality"])]
 
-echo "$INPUT_FILES" | while IFS= read -r INPUT_FILE; do
-    # Check for cancel
-    if ! kill -0 $PROGRESS_PID 2>/dev/null; then
-        echo "⚠️ Cancelled by user" >> "$LOG_FILE"
-        break
-    fi
-    
-    [[ -z "$INPUT_FILE" ]] && continue
-    [[ ! -f "$INPUT_FILE" ]] && continue
-    
-    ((COUNTER++))
-    
-    BASENAME=$(basename "$INPUT_FILE")
-    FILENAME="${BASENAME%.*}"
-    
-    # Get file info
-    FILE_DURATION=$(get_file_duration "$INPUT_FILE")
-    FILE_SIZE=$(get_file_size_mb "$INPUT_FILE")
-    
-    # Determine suffix based on mode
-    case "$FILENAME_MODE" in
-        "Add suffix"*)
-            [[ "$OUTPUT_TYPE" == "Audio only" ]] && SUFFIX="_audio" || SUFFIX="_converted"
-            ;;
-        "Same filename")
-            SUFFIX=""
-            ;;
-        "Custom"*)
-            SUFFIX="$CUSTOM_SUFFIX"
-            ;;
-    esac
-    
-    # Determine extension
-    EXT=$(get_output_extension "$VIDEO_CODEC" "$OUTPUT_TYPE" "$AUDIO_CODEC")
-    
-    OUTPUT_FILE="$OUTPUT_FOLDER/${FILENAME}${SUFFIX}.${EXT}"
-    
-    # Check if file exists
-    if [[ -f "$OUTPUT_FILE" ]] && [[ "$OVERWRITE_FILES" == "FALSE" ]]; then
-        echo "# ⏭️  Skipped: $BASENAME (already exists)" >&3
-        echo "SKIPPED: $BASENAME (file exists)" >> "$LOG_FILE"
-        ((SKIPPED_COUNT++))
-        continue
-    fi
-    
-    # Update progress bar
-    PERCENT=$((COUNTER * 100 / TOTAL_FILES))
-    echo "$PERCENT" >&3
-    echo "# [$COUNTER/$TOTAL_FILES] Converting: $BASENAME" >&3
-    echo "# Size: ${FILE_SIZE}MB | Duration: $(format_time ${FILE_DURATION}) | Quality: $QUALITY" >&3
-    
-    # Calculate ETA
-    if [[ $COUNTER -gt 1 ]]; then
-        ELAPSED=$(($(date +%s) - START_TIME))
-        AVG_TIME=$((ELAPSED / (COUNTER - 1)))
-        REMAINING_FILES=$((TOTAL_FILES - COUNTER))
-        ETA=$((AVG_TIME * REMAINING_FILES))
-        echo "# ETA: $(format_time $ETA) remaining" >&3
-    fi
-    
-    # Build ffmpeg command
-    CMD=(ffmpeg -i "$INPUT_FILE" -y -hide_banner -loglevel error -stats)
-    
-    # VIDEO HANDLING
-    if [[ "$OUTPUT_TYPE" == "Audio only" ]]; then
-        CMD+=(-vn)
-    elif [[ "$VIDEO_MODE" == "Copy"* ]]; then
-        CMD+=(-c:v copy)
-    else
-        VCODEC=$(get_video_codec "$VIDEO_CODEC" "$USE_GPU")
-        CMD+=(-c:v "$VCODEC")
-        
-        PROFILE=$(get_dnxhr_profile "$VIDEO_CODEC")
-        [[ -n "$PROFILE" ]] && CMD+=(-profile:v "$PROFILE")
-        
-        PRORES_PROFILE=$(get_prores_profile "$VIDEO_CODEC")
-        [[ -n "$PRORES_PROFILE" ]] && CMD+=(-profile:v "$PRORES_PROFILE")
-        
-        PIXFMT=$(get_pix_fmt "$VIDEO_CODEC")
-        CMD+=(-pix_fmt "$PIXFMT")
-        
-        SCALE=$(get_resolution_scale "$RESOLUTION")
-        [[ -n "$SCALE" ]] && CMD+=(-vf "$SCALE")
-        
-        if [[ "$VCODEC" == "libx264" ]] || [[ "$VCODEC" == "libx265" ]]; then
-            PRESET=$(get_quality_preset "$VCODEC" "$QUALITY")
-            CRF=$(get_quality_crf "$VCODEC" "$QUALITY")
-            CMD+=(-preset "$PRESET" -crf "$CRF")
-        elif [[ "$VCODEC" == *"nvenc"* ]]; then
-            PRESET=$(get_quality_preset "$VCODEC" "$QUALITY")
-            CQ=$(get_nvenc_quality "$QUALITY")
-            CMD+=(-preset "$PRESET" -cq "$CQ")
-        fi
-    fi
-    
-    # AUDIO HANDLING
-    if [[ "$OUTPUT_TYPE" == "Video only" ]] || [[ "$CONVERT_AUDIO" == "FALSE" ]]; then
-        CMD+=(-an)
-    else
-        ACODEC=$(get_audio_codec "$AUDIO_CODEC")
-        CMD+=(-c:a "$ACODEC")
-        
-        if [[ "$SAMPLE_RATE" != "Original" ]]; then
-            CMD+=(-ar "$SAMPLE_RATE")
-        fi
-        
-        if [[ "$AUDIO_CODEC" == "AAC" ]] || [[ "$AUDIO_CODEC" == "MP3" ]]; then
-            AUDIO_BR=$(get_audio_quality "$AUDIO_CODEC" "$QUALITY")
-            CMD+=(-b:a "$AUDIO_BR")
-        elif [[ "$AUDIO_CODEC" == "FLAC" ]]; then
-            FLAC_LEVEL=$(get_audio_quality "$AUDIO_CODEC" "$QUALITY")
-            CMD+=(-compression_level "$FLAC_LEVEL")
-        fi
-    fi
-    
-    CMD+=("$OUTPUT_FILE")
-    
-    # Log the command
-    echo "Converting: $BASENAME" >> "$LOG_FILE"
-    echo "Command: ${CMD[@]}" >> "$LOG_FILE"
-    
-    # Execute conversion
-    if "${CMD[@]}" 2>&1 | while IFS= read -r line; do
-        if [[ "$line" =~ time=([0-9:\.]+) ]]; then
-            CURRENT_TIME="${BASH_REMATCH[1]}"
-            echo "# [$COUNTER/$TOTAL_FILES] $BASENAME → $CURRENT_TIME / $(format_time ${FILE_DURATION})" >&3
-        fi
-    done; then
-        # Success
-        if [[ -f "$OUTPUT_FILE" ]]; then
-            OUTPUT_SIZE=$(get_file_size_mb "$OUTPUT_FILE")
-            
-            if [[ $FILE_SIZE -gt 0 ]] && [[ $OUTPUT_SIZE -gt 0 ]]; then
-                COMPRESSION_RATIO=$(awk "BEGIN {printf \"%.1f\", $FILE_SIZE / $OUTPUT_SIZE}")
-                echo "# ✓ Done: $BASENAME (${OUTPUT_SIZE}MB) - ${COMPRESSION_RATIO}x compression" >&3
-                echo "SUCCESS: $BASENAME → ${OUTPUT_SIZE}MB (${COMPRESSION_RATIO}x)" >> "$LOG_FILE"
-            else
-                echo "# ✓ Done: $BASENAME (${OUTPUT_SIZE}MB)" >&3
-                echo "SUCCESS: $BASENAME → ${OUTPUT_SIZE}MB" >> "$LOG_FILE"
-            fi
-            ((SUCCESS_COUNT++))
-        else
-            echo "# ❌ FAILED: $BASENAME (output file not created)" >&3
-            echo "FAILED: $BASENAME (output not created)" >> "$LOG_FILE"
-            ((FAILED_COUNT++))
-        fi
-    else
-        # FFmpeg error
-        echo "# ❌ FAILED: $BASENAME (ffmpeg error)" >&3
-        echo "FAILED: $BASENAME (ffmpeg error)" >> "$LOG_FILE"
-        ((FAILED_COUNT++))
-    fi
-    
-    echo "" >> "$LOG_FILE"
-    
-done
+    if s["output_type"] == "Video only" or not s["convert_audio"]:
+        cmd += ["-an"]
+    else:
+        acodec = get_audio_codec_name(s["audio_codec"])
+        cmd += ["-c:a", acodec]
+        if s["sample_rate"] != "Original":
+            cmd += ["-ar", s["sample_rate"]]
+        if s["audio_codec"] in ("AAC", "MP3"):
+            cmd += ["-b:a", get_audio_quality(s["audio_codec"], s["quality"])]
+        elif s["audio_codec"] == "FLAC":
+            cmd += ["-compression_level", get_audio_quality(s["audio_codec"], s["quality"])]
 
-# Final completion
-echo "100" >&3
+    cmd += [output_file]
+    return cmd
 
-# Generate summary
-{
-    echo "========================================="
-    echo "  CONVERSION SUMMARY"
-    echo "========================================="
-    echo "Total files: $TOTAL_FILES"
-    echo "Successful: $SUCCESS_COUNT"
-    echo "Failed: $FAILED_COUNT"
-    echo "Skipped: $SKIPPED_COUNT"
-    echo ""
-    echo "Total time: $(format_time $(($(date +%s) - START_TIME)))"
-    echo "========================================="
-} >> "$LOG_FILE"
 
-if [[ $FAILED_COUNT -eq 0 ]]; then
-    echo "# ✅ All files processed successfully! ($SUCCESS_COUNT succeeded, $SKIPPED_COUNT skipped)" >&3
-else
-    echo "# ⚠️  Completed with errors! ($SUCCESS_COUNT succeeded, $FAILED_COUNT failed, $SKIPPED_COUNT skipped)" >&3
-fi
+# --------------------------------------------------------------------------
+# UI helpers
+# --------------------------------------------------------------------------
 
-exec 3>&-
-wait $PROGRESS_PID 2>/dev/null
+def make_combo_row(title, items, selected=0, subtitle=None):
+    row = Adw.ComboRow(title=title)
+    if subtitle:
+        row.set_subtitle(subtitle)
+    row.set_model(Gtk.StringList.new(items))
+    row.set_selected(selected)
+    return row
 
-# ========================================
-# COMPLETION DIALOG
-# ========================================
 
-if [[ $FAILED_COUNT -eq 0 ]]; then
-    COMPLETION_TEXT="✅ <b>$SUCCESS_COUNT files converted successfully!</b>"
-    [[ $SKIPPED_COUNT -gt 0 ]] && COMPLETION_TEXT="$COMPLETION_TEXT\n⏭️  $SKIPPED_COUNT files skipped (already exist)"
-else
-    COMPLETION_TEXT="⚠️  <b>Completed with errors</b>\n\n✅ Success: $SUCCESS_COUNT\n❌ Failed: $FAILED_COUNT\n⏭️  Skipped: $SKIPPED_COUNT"
-fi
+def combo_value(row: Adw.ComboRow):
+    idx = row.get_selected()
+    model = row.get_model()
+    return model.get_string(idx) if idx != Gtk.INVALID_LIST_POSITION else ""
 
-yad --info --title="Conversion Complete! 🎉" \
-    --text="$COMPLETION_TEXT\n\n📁 Output folder:\n<tt>$OUTPUT_FOLDER</tt>\n\n📄 Log file:\n<tt>$(basename "$LOG_FILE")</tt>\n\n🎬 Ready for DaVinci Resolve!" \
-    --width=550 \
-    --button="Open Folder:xdg-open '$OUTPUT_FOLDER'" \
-    --button="View Log:xdg-open '$LOG_FILE'" \
-    --button="Close:0"
+
+def set_combo_value(row: Adw.ComboRow, value):
+    model = row.get_model()
+    for i in range(model.get_n_items()):
+        if model.get_string(i) == value:
+            row.set_selected(i)
+            return
+
+
+# --------------------------------------------------------------------------
+# Main window
+# --------------------------------------------------------------------------
+
+class ConverterWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="DaVinci Converter")
+        self.set_default_size(640, 780)
+
+        self.input_files = []
+        self.has_nvenc = check_nvenc_support()
+        self.cancel_event = threading.Event()
+        self.config = load_config()
+
+        self.toolbar_view = Adw.ToolbarView()
+        self.set_content(self.toolbar_view)
+
+        header = Adw.HeaderBar()
+        self.toolbar_view.add_top_bar(header)
+
+        # Stack: settings page <-> progress page
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.toolbar_view.set_content(self.stack)
+
+        self.settings_page = self.build_settings_page()
+        self.stack.add_named(self.settings_page, "settings")
+
+        self.progress_page = self.build_progress_page()
+        self.stack.add_named(self.progress_page, "progress")
+
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            GLib.idle_add(self.show_missing_deps_dialog)
+
+    # ---------------- settings page ----------------
+
+    def build_settings_page(self):
+        scroller = Gtk.ScrolledWindow(vexpand=True)
+        page = Adw.PreferencesPage()
+        scroller.set_child(page)
+
+        # Files group
+        files_group = Adw.PreferencesGroup(
+            title="Media Files",
+            description="✅ NVENC available" if self.has_nvenc else "⚠️ NVENC not detected — will use CPU encoding",
+        )
+        page.add(files_group)
+
+        self.files_row = Adw.ActionRow(title="No files selected")
+        pick_btn = Gtk.Button(label="Select Files…", valign=Gtk.Align.CENTER)
+        pick_btn.add_css_class("suggested-action")
+        pick_btn.connect("clicked", self.on_pick_files)
+        self.files_row.add_suffix(pick_btn)
+        files_group.add(self.files_row)
+
+        # Preset
+        preset_group = Adw.PreferencesGroup(title="Quick Preset")
+        page.add(preset_group)
+        self.preset_row = make_combo_row("Load Preset", PRESETS)
+        self.preset_row.connect("notify::selected", self.on_preset_changed)
+        preset_group.add(self.preset_row)
+
+        # Video
+        video_group = Adw.PreferencesGroup(title="Video Settings")
+        page.add(video_group)
+        self.video_mode_row = make_combo_row("Video Mode", VIDEO_MODES)
+        self.resolution_row = make_combo_row("Resolution", RESOLUTIONS)
+        self.video_codec_row = make_combo_row("Video Codec", VIDEO_CODECS)
+        self.quality_row = make_combo_row("Quality", QUALITIES)
+        for r in (self.video_mode_row, self.resolution_row, self.video_codec_row, self.quality_row):
+            video_group.add(r)
+
+        # Audio
+        audio_group = Adw.PreferencesGroup(title="Audio Settings")
+        page.add(audio_group)
+        self.convert_audio_row = Adw.SwitchRow(title="Convert Audio", active=True)
+        self.audio_codec_row = make_combo_row("Audio Codec", AUDIO_CODECS)
+        self.sample_rate_row = make_combo_row("Sample Rate", SAMPLE_RATES)
+        for r in (self.convert_audio_row, self.audio_codec_row, self.sample_rate_row):
+            audio_group.add(r)
+
+        # Output
+        output_group = Adw.PreferencesGroup(title="Output")
+        page.add(output_group)
+        self.output_type_row = make_combo_row("Output Type", OUTPUT_TYPES)
+        output_group.add(self.output_type_row)
+
+        default_folder = os.path.join(os.path.expanduser("~"), "converted")
+        self.output_folder = self.config.get("output_folder", default_folder)
+        self.folder_row = Adw.ActionRow(title="Output Folder", subtitle=self.output_folder)
+        folder_btn = Gtk.Button(label="Choose…", valign=Gtk.Align.CENTER)
+        folder_btn.connect("clicked", self.on_pick_folder)
+        self.folder_row.add_suffix(folder_btn)
+        output_group.add(self.folder_row)
+
+        self.filename_mode_row = make_combo_row("Filename Handling", FILENAME_MODES)
+        self.filename_mode_row.connect("notify::selected", self.on_filename_mode_changed)
+        output_group.add(self.filename_mode_row)
+
+        self.custom_suffix_row = Adw.EntryRow(title="Custom Suffix", text="_custom")
+        self.custom_suffix_row.set_visible(False)
+        output_group.add(self.custom_suffix_row)
+
+        self.overwrite_row = Adw.SwitchRow(title="Overwrite Existing Files", active=False)
+        output_group.add(self.overwrite_row)
+
+        # Advanced
+        advanced_group = Adw.PreferencesGroup(title="Advanced")
+        page.add(advanced_group)
+        self.use_gpu_row = Adw.SwitchRow(title="Use GPU (NVENC)", active=self.has_nvenc)
+        self.use_gpu_row.set_sensitive(self.has_nvenc)
+        self.dry_run_row = Adw.SwitchRow(title="Dry Run (preview commands only)", active=False)
+        advanced_group.add(self.use_gpu_row)
+        advanced_group.add(self.dry_run_row)
+
+        # Convert button
+        action_group = Adw.PreferencesGroup()
+        page.add(action_group)
+        convert_btn = Gtk.Button(label="Convert Now")
+        convert_btn.add_css_class("suggested-action")
+        convert_btn.add_css_class("pill")
+        convert_btn.set_margin_top(12)
+        convert_btn.set_margin_bottom(24)
+        convert_btn.connect("clicked", self.on_convert_clicked)
+        action_group.add(convert_btn)
+
+        return scroller
+
+    # ---------------- progress page ----------------
+
+    def build_progress_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                       margin_top=24, margin_bottom=24, margin_start=24, margin_end=24)
+
+        self.progress_title = Gtk.Label(label="Converting…", xalign=0)
+        self.progress_title.add_css_class("title-2")
+        box.append(self.progress_title)
+
+        self.progress_bar = Gtk.ProgressBar(show_text=True)
+        box.append(self.progress_bar)
+
+        self.progress_status = Gtk.Label(label="", xalign=0, wrap=True)
+        box.append(self.progress_status)
+
+        log_scroller = Gtk.ScrolledWindow(vexpand=True)
+        self.log_buffer = Gtk.TextBuffer()
+        log_view = Gtk.TextView(buffer=self.log_buffer, editable=False, monospace=True)
+        log_view.set_top_margin(6)
+        log_view.set_bottom_margin(6)
+        log_view.set_left_margin(6)
+        log_scroller.set_child(log_view)
+        log_scroller.add_css_class("card")
+        box.append(log_scroller)
+
+        self.cancel_btn = Gtk.Button(label="Cancel")
+        self.cancel_btn.add_css_class("destructive-action")
+        self.cancel_btn.connect("clicked", self.on_cancel_clicked)
+        box.append(self.cancel_btn)
+
+        return box
+
+    # ---------------- event handlers ----------------
+
+    def show_missing_deps_dialog(self):
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Missing dependency",
+            body="ffmpeg / ffprobe not found.\n\nInstall on Arch:\n  sudo pacman -S ffmpeg",
+        )
+        dialog.add_response("ok", "OK")
+        dialog.present()
+
+    def on_pick_files(self, _btn):
+        dialog = Gtk.FileChooserNative.new(
+            "Select Media Files", self, Gtk.FileChooserAction.OPEN, "Select", "Cancel"
+        )
+        dialog.set_select_multiple(True)
+
+        video_filter = Gtk.FileFilter(name="Video Files")
+        for ext in ("mp4", "mkv", "mov", "avi", "webm", "flv", "m4v", "mpg", "mpeg", "wmv",
+                    "3gp", "ogv", "mts", "m2ts", "ts"):
+            video_filter.add_pattern(f"*.{ext}")
+
+        audio_filter = Gtk.FileFilter(name="Audio Files")
+        for ext in ("mp3", "wav", "flac", "aac", "m4a", "ogg", "opus", "wma", "ape", "alac", "aiff"):
+            audio_filter.add_pattern(f"*.{ext}")
+
+        all_filter = Gtk.FileFilter(name="All Files")
+        all_filter.add_pattern("*")
+
+        dialog.add_filter(video_filter)
+        dialog.add_filter(audio_filter)
+        dialog.add_filter(all_filter)
+
+        dialog.connect("response", self.on_files_chosen)
+        dialog.show()
+
+    def on_files_chosen(self, dialog, response):
+        if response == Gtk.ResponseType.ACCEPT:
+            files = dialog.get_files()
+            self.input_files = [f.get_path() for f in files]
+            n = len(self.input_files)
+            if n:
+                self.files_row.set_title(f"{n} file(s) selected")
+                names = ", ".join(os.path.basename(p) for p in self.input_files[:3])
+                if n > 3:
+                    names += f", +{n - 3} more"
+                self.files_row.set_subtitle(names)
+        dialog.destroy()
+
+    def on_pick_folder(self, _btn):
+        dialog = Gtk.FileChooserNative.new(
+            "Select Output Folder", self, Gtk.FileChooserAction.SELECT_FOLDER, "Select", "Cancel"
+        )
+        dialog.connect("response", self.on_folder_chosen)
+        dialog.show()
+
+    def on_folder_chosen(self, dialog, response):
+        if response == Gtk.ResponseType.ACCEPT:
+            folder = dialog.get_file().get_path()
+            if folder:
+                self.output_folder = folder
+                self.folder_row.set_subtitle(folder)
+                self.config["output_folder"] = folder
+                save_config(self.config)
+        dialog.destroy()
+
+    def on_filename_mode_changed(self, row, _pspec):
+        self.custom_suffix_row.set_visible(combo_value(row).startswith("Custom"))
+
+    def on_preset_changed(self, row, _pspec):
+        preset = combo_value(row)
+        overrides = PRESET_OVERRIDES.get(preset)
+        if not overrides:
+            return
+        if "video_codec" in overrides:
+            set_combo_value(self.video_codec_row, overrides["video_codec"])
+        if "resolution" in overrides:
+            set_combo_value(self.resolution_row, overrides["resolution"])
+        if "quality" in overrides:
+            set_combo_value(self.quality_row, overrides["quality"])
+        if "audio_codec" in overrides:
+            set_combo_value(self.audio_codec_row, overrides["audio_codec"])
+        if "sample_rate" in overrides:
+            set_combo_value(self.sample_rate_row, overrides["sample_rate"])
+        if "output_type" in overrides:
+            set_combo_value(self.output_type_row, overrides["output_type"])
+
+    def gather_settings(self):
+        return {
+            "video_mode": combo_value(self.video_mode_row),
+            "resolution": combo_value(self.resolution_row),
+            "video_codec": combo_value(self.video_codec_row),
+            "quality": combo_value(self.quality_row),
+            "convert_audio": self.convert_audio_row.get_active(),
+            "audio_codec": combo_value(self.audio_codec_row),
+            "sample_rate": combo_value(self.sample_rate_row),
+            "output_type": combo_value(self.output_type_row),
+            "filename_mode": combo_value(self.filename_mode_row),
+            "custom_suffix": self.custom_suffix_row.get_text(),
+            "overwrite": self.overwrite_row.get_active(),
+            "use_gpu": self.use_gpu_row.get_active(),
+            "dry_run": self.dry_run_row.get_active(),
+        }
+
+    def on_convert_clicked(self, _btn):
+        if not self.input_files:
+            self.toast("Pick some files first!")
+            return
+
+        s = self.gather_settings()
+
+        if s["video_codec"].endswith("(NVENC)") and not self.has_nvenc:
+            dialog = Adw.MessageDialog(
+                transient_for=self,
+                heading="NVENC not available",
+                body="Your system doesn't support NVIDIA hardware encoding.\n"
+                     "Falling back to software encoding (slower).",
+            )
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("continue", "Continue")
+            dialog.set_response_appearance("continue", Adw.ResponseAppearance.SUGGESTED)
+            dialog.connect("response", self.on_nvenc_warning_response, s)
+            dialog.present()
+            return
+
+        self.begin_conversion(s)
+
+    def on_nvenc_warning_response(self, dialog, response, s):
+        if response == "continue":
+            s["use_gpu"] = False
+            self.begin_conversion(s)
+
+    def begin_conversion(self, s):
+        os.makedirs(self.output_folder, exist_ok=True)
+        if not os.access(self.output_folder, os.W_OK):
+            self.toast(f"Output folder not writable: {self.output_folder}")
+            return
+
+        if s["dry_run"]:
+            self.run_dry_run(s)
+            return
+
+        self.cancel_event.clear()
+        self.stack.set_visible_child_name("progress")
+        self.progress_title.set_label(f"Converting {len(self.input_files)} file(s)…")
+        self.progress_bar.set_fraction(0.0)
+        self.progress_status.set_label("")
+        self.log_buffer.set_text("")
+
+        thread = threading.Thread(target=self.run_conversion, args=(s,), daemon=True)
+        thread.start()
+
+    def on_cancel_clicked(self, _btn):
+        self.cancel_event.set()
+        self.progress_status.set_label("Cancelling after current file…")
+
+    def toast(self, text):
+        # Lightweight fallback: use a transient message dialog since this
+        # window doesn't own a ToastOverlay.
+        dialog = Adw.MessageDialog(transient_for=self, heading="Heads up", body=text)
+        dialog.add_response("ok", "OK")
+        dialog.present()
+
+    def append_log(self, text):
+        end = self.log_buffer.get_end_iter()
+        self.log_buffer.insert(end, text + "\n")
+
+    # ---------------- dry run ----------------
+
+    def run_dry_run(self, s):
+        plan_path = os.path.join(
+            self.output_folder,
+            f"conversion_plan_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt",
+        )
+        lines = [
+            "=" * 41,
+            "  DAVINCI CONVERTER - DRY RUN",
+            "=" * 41,
+            f"Date: {datetime.datetime.now()}",
+            f"Total files: {len(self.input_files)}",
+            "",
+            "Settings:",
+            f"  Video: {s['video_codec']} | {s['resolution']} | {s['quality']}",
+            f"  Audio: {s['audio_codec']} | {s['sample_rate']}",
+            f"  Output: {s['output_type']}",
+            f"  GPU: {s['use_gpu']}",
+            "",
+            "=" * 41,
+            "Commands to be executed:",
+            "=" * 41,
+            "",
+        ]
+        for input_file in self.input_files:
+            basename = os.path.basename(input_file)
+            filename, _ = os.path.splitext(basename)
+            suffix = get_suffix(s["filename_mode"], s["output_type"], s["custom_suffix"])
+            ext = get_output_extension(s["video_codec"], s["output_type"], s["audio_codec"])
+            output_file = os.path.join(self.output_folder, f"{filename}{suffix}.{ext}")
+            cmd = build_ffmpeg_cmd(input_file, output_file, s)
+            lines.append(f"# File: {basename}")
+            lines.append(f"# Output: {os.path.basename(output_file)}")
+            lines.append(" ".join(cmd))
+            lines.append("")
+
+        with open(plan_path, "w") as f:
+            f.write("\n".join(lines))
+
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Dry Run — Preview Saved",
+            body=f"Plan written to:\n{plan_path}",
+        )
+        dialog.add_response("open", "Open File")
+        dialog.add_response("close", "Close")
+        dialog.connect("response", lambda d, r: subprocess.Popen(["xdg-open", plan_path]) if r == "open" else None)
+        dialog.present()
+
+    # ---------------- real conversion (background thread) ----------------
+
+    def run_conversion(self, s):
+        total = len(self.input_files)
+        success = failed = skipped = 0
+        start_time = datetime.datetime.now()
+
+        log_path = os.path.join(
+            self.output_folder,
+            f"conversion_log_{start_time:%Y%m%d_%H%M%S}.txt",
+        )
+        log_lines = [
+            "=" * 41, "  DAVINCI CONVERTER LOG", "=" * 41,
+            f"Date: {start_time}", f"Total files: {total}", "",
+            "Settings:",
+            f"  Video: {s['video_codec']} | {s['resolution']} | {s['quality']}",
+            f"  Audio: {s['audio_codec']} | {s['sample_rate']}",
+            f"  Output: {s['output_type']}", f"  GPU: {s['use_gpu']}", "",
+            "=" * 41, "",
+        ]
+
+        for i, input_file in enumerate(self.input_files, start=1):
+            if self.cancel_event.is_set():
+                log_lines.append("⚠️ Cancelled by user")
+                break
+            if not os.path.isfile(input_file):
+                continue
+
+            basename = os.path.basename(input_file)
+            filename, _ = os.path.splitext(basename)
+            file_duration = get_file_duration(input_file)
+            file_size = get_file_size_mb(input_file)
+
+            suffix = get_suffix(s["filename_mode"], s["output_type"], s["custom_suffix"])
+            ext = get_output_extension(s["video_codec"], s["output_type"], s["audio_codec"])
+            output_file = os.path.join(self.output_folder, f"{filename}{suffix}.{ext}")
+
+            if os.path.exists(output_file) and not s["overwrite"]:
+                skipped += 1
+                GLib.idle_add(self.progress_status.set_label, f"⏭️  Skipped: {basename} (already exists)")
+                GLib.idle_add(self.append_log, f"SKIPPED: {basename} (file exists)")
+                log_lines.append(f"SKIPPED: {basename} (file exists)")
+                continue
+
+            fraction = i / total
+            GLib.idle_add(self.progress_bar.set_fraction, fraction)
+            GLib.idle_add(self.progress_bar.set_text, f"{i}/{total}")
+            GLib.idle_add(
+                self.progress_status.set_label,
+                f"[{i}/{total}] {basename}  ·  {file_size}MB  ·  {format_time(file_duration)}  ·  {s['quality']}",
+            )
+
+            cmd = build_ffmpeg_cmd(input_file, output_file, s)
+            log_lines.append(f"Converting: {basename}")
+            log_lines.append(f"Command: {' '.join(cmd)}")
+            GLib.idle_add(self.append_log, f"▶ {basename}")
+
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                )
+                for line in proc.stdout:
+                    if self.cancel_event.is_set():
+                        proc.terminate()
+                        break
+                    m = re.search(r"time=([0-9:.]+)", line)
+                    if m:
+                        GLib.idle_add(
+                            self.progress_status.set_label,
+                            f"[{i}/{total}] {basename} → {m.group(1)} / {format_time(file_duration)}",
+                        )
+                proc.wait()
+                ok = proc.returncode == 0
+            except FileNotFoundError:
+                ok = False
+
+            if ok and os.path.isfile(output_file):
+                out_size = get_file_size_mb(output_file)
+                if file_size > 0 and out_size > 0:
+                    ratio = file_size / out_size
+                    msg = f"✓ Done: {basename} ({out_size}MB) — {ratio:.1f}x compression"
+                    log_lines.append(f"SUCCESS: {basename} → {out_size}MB ({ratio:.1f}x)")
+                else:
+                    msg = f"✓ Done: {basename} ({out_size}MB)"
+                    log_lines.append(f"SUCCESS: {basename} → {out_size}MB")
+                success += 1
+            else:
+                msg = f"❌ FAILED: {basename}"
+                log_lines.append(f"FAILED: {basename}")
+                failed += 1
+
+            GLib.idle_add(self.append_log, msg)
+            log_lines.append("")
+
+        elapsed = (datetime.datetime.now() - start_time).total_seconds()
+        log_lines += [
+            "=" * 41, "  CONVERSION SUMMARY", "=" * 41,
+            f"Total files: {total}", f"Successful: {success}",
+            f"Failed: {failed}", f"Skipped: {skipped}", "",
+            f"Total time: {format_time(elapsed)}", "=" * 41,
+        ]
+        with open(log_path, "w") as f:
+            f.write("\n".join(log_lines))
+
+        GLib.idle_add(self.progress_bar.set_fraction, 1.0)
+        GLib.idle_add(self.finish_conversion, success, failed, skipped, log_path)
+
+    def finish_conversion(self, success, failed, skipped, log_path):
+        self.stack.set_visible_child_name("settings")
+
+        if failed == 0:
+            body = f"✅ {success} file(s) converted successfully!"
+            if skipped:
+                body += f"\n⏭️  {skipped} file(s) skipped (already existed)"
+        else:
+            body = f"⚠️ Completed with errors\n\n✅ Success: {success}\n❌ Failed: {failed}\n⏭️  Skipped: {skipped}"
+
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Conversion Complete 🎉",
+            body=f"{body}\n\n📁 {self.output_folder}\n📄 {os.path.basename(log_path)}",
+        )
+        dialog.add_response("open_folder", "Open Folder")
+        dialog.add_response("view_log", "View Log")
+        dialog.add_response("close", "Close")
+
+        def handle(d, r):
+            if r == "open_folder":
+                subprocess.Popen(["xdg-open", self.output_folder])
+            elif r == "view_log":
+                subprocess.Popen(["xdg-open", log_path])
+
+        dialog.connect("response", handle)
+        dialog.present()
+
+
+class ConverterApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self):
+        win = self.props.active_window or ConverterWindow(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    import sys
+    app = ConverterApp()
+    app.run(sys.argv)
