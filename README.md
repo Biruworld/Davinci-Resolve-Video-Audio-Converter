@@ -72,6 +72,8 @@ Tips for NixOS:
 nix-shell -p python3 python3Packages.pygobject3 ffmpeg
 ```
 
+Then run the py file. 
+
 ## ⚠️ Caution
 This is still an early stage, I am apologize if I made some serious mistakes or maybe even the script. If there anything, please tell me. Thank you so much!
 
