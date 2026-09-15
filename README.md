@@ -66,6 +66,12 @@ How to Run?
 ```bash
 davinci-resolve
 ```
+
+Tips for NixOS: 
+```bash
+nix-shell -p python3 python3Packages.pygobject3 ffmpeg
+```
+
 ## ⚠️ Caution
 This is still an early stage, I am apologize if I made some serious mistakes or maybe even the script. If there anything, please tell me. Thank you so much!
 
