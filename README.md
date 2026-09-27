@@ -71,8 +71,12 @@ Tips for NixOS:
 ```bash
 nix-shell -p python3 python3Packages.pygobject3 ffmpeg
 ```
+Then run the py file. Make sure you're on the directory itself.
+or
+```bash
+nix-shell -p gobject-introspection gtk4 libadwaita "python3.withPackages (ps: [ ps.pygobject3 ])" --run "python3 'TNixOS.py'"
+```
 
-Then run the py file. 
 
 ## ⚠️ Caution
 This is still an early stage, I am apologize if I made some serious mistakes or maybe even the script. If there anything, please tell me. Thank you so much!
