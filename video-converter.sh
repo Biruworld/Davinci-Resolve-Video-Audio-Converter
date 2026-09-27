@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
 """
-DaVinci Converter — GTK4 / libadwaita edition (v2)
+DaVinci Converter — GTK4 / libadwaita edition (v3)
 
 A native ffmpeg front-end for prepping footage for DaVinci Resolve:
 DNxHR / ProRes proxies, NVENC hardware encodes, and plain audio
 extraction — with a queue you can inspect, reorder and re-run.
 
+v3 changes:
+  - Optional NVDEC (-hwaccel cuda) decode acceleration, auto-detected,
+    with automatic fallback to CPU decoding if it fails or isn't present.
+  - Rough estimated-output-size readout based on codec/resolution/quality
+    and the total duration of the queued files.
+
 Dependencies (Arch):
     sudo pacman -S python-gobject gtk4 libadwaita ffmpeg
+
+Dependencies (NixOS, e.g. in your shell.nix / home-manager):
+    pkgs.python3.withPackages (ps: [ ps.pygobject3 ])
+    pkgs.gtk4
+    pkgs.libadwaita
+    pkgs.ffmpeg-full   # build with --enable-cuda / nvdec + nvenc support
 """
 
 from __future__ import annotations
@@ -29,7 +41,7 @@ import threading
 import concurrent.futures
 import dataclasses
 import datetime
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from typing import Optional
 
 APP_ID = "sh.asterlusnce.davinciconverter"
@@ -152,6 +164,7 @@ class ConversionSettings:
     custom_suffix: str = "_custom"
     overwrite: bool = False
     use_gpu: bool = False
+    use_hwaccel_decode: bool = False
     dry_run: bool = False
     parallel_jobs: int = 1
 
@@ -298,6 +311,21 @@ def get_file_duration(path: str) -> int:
         return 0
 
 
+def get_video_resolution(path: str) -> Optional[tuple[int, int]]:
+    """Best-effort probe of the source's pixel dimensions, for size estimates."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height",
+             "-of", "csv=s=x:p=0", path],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        w_str, h_str = out.split("x")
+        return int(w_str), int(h_str)
+    except Exception:
+        return None
+
+
 def format_time(seconds: float) -> str:
     seconds = int(seconds or 0)
     h, rem = divmod(seconds, 3600)
@@ -313,6 +341,7 @@ def get_file_size_mb(path: str) -> float:
 
 
 def check_nvenc_support() -> bool:
+    """Does this ffmpeg build have NVENC hardware *encoders*?"""
     try:
         out = subprocess.run(
             ["ffmpeg", "-hide_banner", "-encoders"],
@@ -323,8 +352,145 @@ def check_nvenc_support() -> bool:
         return False
 
 
+def check_nvdec_support() -> bool:
+    """Does this ffmpeg build advertise the 'cuda' hwaccel for GPU *decoding*?
+
+    This is independent of NVENC: it only tells us whether decode can be
+    offloaded to the GPU (NVDEC), which helps regardless of which output
+    codec is chosen (DNxHR, ProRes, H.264, ...) since decode of the source
+    H.264/H.265 file is what's expensive on CPU.
+    """
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-hwaccels"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        return "cuda" in out.lower()
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------
+# Rough output-size estimation
+#
+# These are ballpark data rates, not exact — actual size depends on source
+# content, motion, chroma subsampling nuances, and encoder version. Good
+# enough to sanity-check "will this fit on my drive" before a long batch.
+# --------------------------------------------------------------------------
+
+BASE_PIXELS_1080P = 1920 * 1080
+
+RESOLUTION_PIXELS = {
+    "1080p": 1920 * 1080,
+    "720p": 1280 * 720,
+    "540p": 960 * 540,
+    "360p": 640 * 360,
+    "240p": 426 * 240,
+    "144p": 256 * 144,
+}
+
+# Approx encoded data rate in Mbit/s at 1920x1080 @ ~24-30fps, 8-bit 4:2:2.
+DNXHR_MBPS_1080P = {
+    "DNxHR LB (Proxy - Recommended)": 36,
+    "DNxHR SQ": 90,
+    "DNxHR HQ ⚠ Heavy": 145,
+}
+PRORES_MBPS_1080P = {
+    "ProRes Proxy": 45,
+    "ProRes 422 ⚠ Heavy": 147,
+}
+# CRF-based codecs don't have a fixed data rate; these are rough typical
+# averages for normal-motion footage at each CRF/preset tier.
+H264_MBPS_1080P = {"Low": 2.5, "Medium": 6, "High": 12, "Ultra": 20}
+H265_MBPS_1080P = {"Low": 1.5, "Medium": 3.5, "High": 7, "Ultra": 12}
+NVENC_H264_MBPS_1080P = {"Low": 3, "Medium": 7, "High": 14, "Ultra": 22}
+NVENC_H265_MBPS_1080P = {"Low": 2, "Medium": 4.5, "High": 9, "Ultra": 14}
+
+PCM_KBPS = {"PCM 16-bit": 1536, "PCM 24-bit": 2304}  # 48kHz stereo
+FLAC_APPROX_KBPS = {"Low": 700, "Medium": 850, "High": 950, "Ultra": 1000}  # lossless, content-dependent
+
+
+def estimate_pixel_ratio(resolution: str, source_dims: Optional[tuple[int, int]]) -> float:
+    if resolution in RESOLUTION_PIXELS:
+        return RESOLUTION_PIXELS[resolution] / BASE_PIXELS_1080P
+    # "Original": use the probed source resolution if we have it, else assume 1080p
+    if source_dims:
+        w, h = source_dims
+        return (w * h) / BASE_PIXELS_1080P
+    return 1.0
+
+
+def estimate_video_mbps(video_codec: str, resolution: str, quality: str,
+                         use_gpu: bool, source_dims: Optional[tuple[int, int]]) -> Optional[float]:
+    ratio = estimate_pixel_ratio(resolution, source_dims)
+    q = q_word(quality)
+    if video_codec.startswith("DNxHR"):
+        base = DNXHR_MBPS_1080P.get(video_codec)
+    elif video_codec.startswith("ProRes"):
+        base = PRORES_MBPS_1080P.get(video_codec)
+    elif video_codec.startswith("H.264 (NVENC)"):
+        base = (NVENC_H264_MBPS_1080P if use_gpu else H264_MBPS_1080P).get(q)
+    elif video_codec.startswith("H.265 (NVENC)"):
+        base = (NVENC_H265_MBPS_1080P if use_gpu else H265_MBPS_1080P).get(q)
+    elif video_codec.startswith("H.264"):
+        base = H264_MBPS_1080P.get(q)
+    else:
+        base = None
+    if base is None:
+        return None
+    return base * ratio
+
+
+def estimate_audio_mbps(audio_codec: str, quality: str) -> float:
+    if audio_codec in PCM_KBPS:
+        return PCM_KBPS[audio_codec] / 1000
+    if audio_codec == "FLAC":
+        return FLAC_APPROX_KBPS.get(q_word(quality), 850) / 1000
+    kbps_str = get_audio_quality(audio_codec, quality)  # e.g. "192k"
+    if kbps_str:
+        return int(kbps_str.rstrip("k")) / 1000
+    return 0.0
+
+
+def estimate_output_size_mb(duration_seconds: float, s: ConversionSettings,
+                             source_dims: Optional[tuple[int, int]] = None) -> Optional[float]:
+    """Returns an estimated MB for ONE file's output, or None if it can't be
+    estimated (e.g. stream-copy mode, where output size just tracks the
+    source's own bitrate and isn't something we can predict from settings)."""
+    if duration_seconds <= 0:
+        return 0.0
+
+    video_mbps = 0.0
+    if s.output_type != "Audio only":
+        if s.video_mode.startswith("Copy"):
+            return None
+        v = estimate_video_mbps(s.video_codec, s.resolution, s.quality, s.use_gpu, source_dims)
+        if v is None:
+            return None
+        video_mbps = v
+
+    audio_mbps = 0.0
+    if s.output_type != "Video only" and s.convert_audio:
+        audio_mbps = estimate_audio_mbps(s.audio_codec, s.quality)
+
+    total_mbps = video_mbps + audio_mbps
+    return total_mbps * duration_seconds / 8  # Mbit/s -> MB over the duration
+
+
 def build_ffmpeg_cmd(input_file: str, output_file: str, s: ConversionSettings) -> list[str]:
-    cmd = ["ffmpeg", "-i", input_file, "-y", "-hide_banner", "-loglevel", "error", "-stats"]
+    cmd = ["ffmpeg"]
+
+    # GPU-accelerated decode (NVDEC) of the *source*. This is independent of
+    # the output codec: even a CPU-only encode (DNxHR/ProRes) benefits,
+    # because decoding the incoming H.264/H.265 is what's expensive on CPU.
+    # We deliberately don't pass -hwaccel_output_format cuda, so decoded
+    # frames land back in normal system memory and stay compatible with
+    # every downstream filter/encoder used here (scale, dnxhd, prores_ks,
+    # libx264/265, nvenc).
+    if s.use_hwaccel_decode:
+        cmd += ["-hwaccel", "cuda"]
+
+    cmd += ["-i", input_file, "-y", "-hide_banner", "-loglevel", "error", "-stats"]
 
     if s.output_type == "Audio only":
         cmd += ["-vn"]
@@ -410,12 +576,19 @@ def is_media_file(path: str) -> bool:
 class ConverterWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="DaVinci Converter")
-        self.set_default_size(680, 820)
+        self.set_default_size(680, 860)
 
         self.input_files: list[str] = []
         self.has_nvenc = check_nvenc_support()
+        self.has_nvdec = check_nvdec_support()
         self.cancel_event = threading.Event()
         self.config = load_config()
+
+        # Caches so we don't re-run ffprobe on files we've already measured.
+        self.duration_cache: dict[str, int] = {}
+        self.resolution_cache: dict[str, Optional[tuple[int, int]]] = {}
+        self.total_duration_seconds: float = 0.0
+        self._probe_generation = 0  # invalidates stale background probes
 
         self.toast_overlay = Adw.ToastOverlay()
         self.set_content(self.toast_overlay)
@@ -437,6 +610,7 @@ class ConverterWindow(Adw.ApplicationWindow):
 
         self.setup_drag_and_drop()
         self.restore_settings()
+        self.update_estimate_label()
 
         if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
             GLib.idle_add(self.show_missing_deps_dialog)
@@ -492,9 +666,12 @@ class ConverterWindow(Adw.ApplicationWindow):
         self.video_mode_row = make_combo_row("Video Mode", VIDEO_MODES)
         self.video_mode_row.connect("notify::selected", self.on_video_mode_changed)
         self.resolution_row = make_combo_row("Resolution", RESOLUTIONS)
+        self.resolution_row.connect("notify::selected", self.on_estimate_relevant_change)
         self.video_codec_row = make_combo_row("Video Codec", VIDEO_CODECS)
         self.video_codec_row.connect("notify::selected", self.on_video_codec_changed)
+        self.video_codec_row.connect("notify::selected", self.on_estimate_relevant_change)
         self.quality_row = make_combo_row("Quality", QUALITIES)
+        self.quality_row.connect("notify::selected", self.on_estimate_relevant_change)
         for r in (self.video_mode_row, self.resolution_row, self.video_codec_row, self.quality_row):
             video_group.add(r)
 
@@ -502,7 +679,9 @@ class ConverterWindow(Adw.ApplicationWindow):
         audio_group = Adw.PreferencesGroup(title="Audio Settings")
         page.add(audio_group)
         self.convert_audio_row = Adw.SwitchRow(title="Convert Audio", active=True)
+        self.convert_audio_row.connect("notify::active", self.on_estimate_relevant_change)
         self.audio_codec_row = make_combo_row("Audio Codec", AUDIO_CODECS)
+        self.audio_codec_row.connect("notify::selected", self.on_estimate_relevant_change)
         self.sample_rate_row = make_combo_row("Sample Rate", SAMPLE_RATES)
         for r in (self.convert_audio_row, self.audio_codec_row, self.sample_rate_row):
             audio_group.add(r)
@@ -511,7 +690,14 @@ class ConverterWindow(Adw.ApplicationWindow):
         output_group = Adw.PreferencesGroup(title="Output")
         page.add(output_group)
         self.output_type_row = make_combo_row("Output Type", OUTPUT_TYPES)
+        self.output_type_row.connect("notify::selected", self.on_estimate_relevant_change)
         output_group.add(self.output_type_row)
+
+        self.estimate_row = Adw.ActionRow(
+            title="Estimated Output Size",
+            subtitle="Add files to see an estimate",
+        )
+        output_group.add(self.estimate_row)
 
         default_folder = os.path.join(os.path.expanduser("~"), "converted")
         self.output_folder = self.config.get("output_folder", default_folder)
@@ -539,8 +725,23 @@ class ConverterWindow(Adw.ApplicationWindow):
         # Advanced
         advanced_group = Adw.PreferencesGroup(title="Advanced")
         page.add(advanced_group)
-        self.use_gpu_row = Adw.SwitchRow(title="Use GPU (NVENC)", active=self.has_nvenc)
+        self.use_gpu_row = Adw.SwitchRow(title="Use GPU (NVENC)", subtitle="Hardware-encode H.264/H.265 output",
+                                          active=self.has_nvenc)
         self.use_gpu_row.set_sensitive(self.has_nvenc)
+        self.use_gpu_row.connect("notify::active", self.on_estimate_relevant_change)
+
+        hwaccel_subtitle = (
+            "Decode the source on GPU (NVDEC) to cut CPU load — works with any output codec"
+            if self.has_nvdec else
+            "Not detected — this ffmpeg build has no CUDA/NVDEC hwaccel"
+        )
+        self.hwaccel_decode_row = Adw.SwitchRow(
+            title="Use GPU Decoding (NVDEC)",
+            subtitle=hwaccel_subtitle,
+            active=self.has_nvdec,
+        )
+        self.hwaccel_decode_row.set_sensitive(self.has_nvdec)
+
         self.parallel_row = make_combo_row(
             "Parallel Conversions", PARALLEL_JOB_OPTIONS,
             subtitle="Run more than one ffmpeg job at once (uses more CPU/RAM)",
@@ -549,6 +750,7 @@ class ConverterWindow(Adw.ApplicationWindow):
             title="Dry Run", subtitle="Preview the ffmpeg commands without running them", active=False,
         )
         advanced_group.add(self.use_gpu_row)
+        advanced_group.add(self.hwaccel_decode_row)
         advanced_group.add(self.parallel_row)
         advanced_group.add(self.dry_run_row)
 
@@ -652,6 +854,8 @@ class ConverterWindow(Adw.ApplicationWindow):
         self.overwrite_row.set_active(s.overwrite)
         if self.has_nvenc:
             self.use_gpu_row.set_active(s.use_gpu)
+        if self.has_nvdec:
+            self.hwaccel_decode_row.set_active(s.use_hwaccel_decode)
         self.dry_run_row.set_active(s.dry_run)
         set_combo_value(self.parallel_row, PARALLEL_JOB_OPTIONS[max(0, s.parallel_jobs - 1)])
 
@@ -674,10 +878,12 @@ class ConverterWindow(Adw.ApplicationWindow):
         self.custom_suffix_row.set_text(defaults.custom_suffix)
         self.overwrite_row.set_active(defaults.overwrite)
         self.use_gpu_row.set_active(self.has_nvenc)
+        self.hwaccel_decode_row.set_active(self.has_nvdec)
         self.dry_run_row.set_active(defaults.dry_run)
         set_combo_value(self.parallel_row, PARALLEL_JOB_OPTIONS[0])
         set_combo_value(self.preset_row, "Custom")
         self.show_toast("Settings reset to defaults")
+        self.update_estimate_label()
 
     # ---------------- event handlers ----------------
 
@@ -745,6 +951,8 @@ class ConverterWindow(Adw.ApplicationWindow):
             self.hint_row.set_title("No files selected")
             self.hint_row.set_subtitle("Drag files onto this window, or select them")
             self.files_listbox.set_visible(False)
+            self.total_duration_seconds = 0.0
+            self.update_estimate_label()
             return
 
         total_mb = sum(get_file_size_mb(p) for p in self.input_files)
@@ -759,6 +967,8 @@ class ConverterWindow(Adw.ApplicationWindow):
             remove_btn.connect("clicked", lambda _b, p=path: self.remove_file(p))
             row.add_suffix(remove_btn)
             self.files_listbox.append(row)
+
+        self.probe_files_for_estimate()
 
     def on_pick_folder(self, _btn):
         dialog = Gtk.FileChooserNative.new(
@@ -789,6 +999,9 @@ class ConverterWindow(Adw.ApplicationWindow):
         codec = combo_value(row)
         self.use_gpu_row.set_sensitive(self.has_nvenc and codec.endswith("(NVENC)"))
 
+    def on_estimate_relevant_change(self, *_args):
+        self.update_estimate_label()
+
     def on_preset_changed(self, row, _pspec):
         preset = combo_value(row)
         overrides = PRESET_OVERRIDES.get(preset)
@@ -806,6 +1019,7 @@ class ConverterWindow(Adw.ApplicationWindow):
             set_combo_value(self.sample_rate_row, overrides["sample_rate"])
         if "output_type" in overrides:
             set_combo_value(self.output_type_row, overrides["output_type"])
+        self.update_estimate_label()
 
     def gather_settings(self) -> ConversionSettings:
         parallel_str = combo_value(self.parallel_row)
@@ -823,9 +1037,74 @@ class ConverterWindow(Adw.ApplicationWindow):
             custom_suffix=self.custom_suffix_row.get_text(),
             overwrite=self.overwrite_row.get_active(),
             use_gpu=self.use_gpu_row.get_active(),
+            use_hwaccel_decode=self.hwaccel_decode_row.get_active(),
             dry_run=self.dry_run_row.get_active(),
             parallel_jobs=parallel_jobs,
         )
+
+    # ---------------- output size estimate ----------------
+
+    def probe_files_for_estimate(self):
+        """ffprobe every queued file's duration (and, for 'Original'
+        resolution, its dimensions) on a background thread so the UI
+        doesn't stall, then refresh the estimate label."""
+        self._probe_generation += 1
+        my_generation = self._probe_generation
+        files = list(self.input_files)
+
+        def worker():
+            total = 0
+            first_dims = None
+            for path in files:
+                if path not in self.duration_cache:
+                    self.duration_cache[path] = get_file_duration(path)
+                total += self.duration_cache[path]
+                if path not in self.resolution_cache:
+                    self.resolution_cache[path] = get_video_resolution(path)
+                if first_dims is None:
+                    first_dims = self.resolution_cache[path]
+            if my_generation == self._probe_generation:
+                GLib.idle_add(self._apply_probe_results, total, first_dims)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_probe_results(self, total_duration: float, first_dims: Optional[tuple[int, int]]):
+        self.total_duration_seconds = total_duration
+        self._first_file_dims = first_dims
+        self.update_estimate_label()
+
+    def update_estimate_label(self):
+        if not self.input_files:
+            self.estimate_row.set_subtitle("Add files to see an estimate")
+            return
+        if self.total_duration_seconds <= 0:
+            self.estimate_row.set_subtitle("Measuring source files…")
+            return
+
+        s = self.gather_settings()
+
+        if s.video_mode.startswith("Copy"):
+            source_mb = sum(get_file_size_mb(p) for p in self.input_files)
+            self.estimate_row.set_subtitle(
+                f"~{source_mb:.0f} MB (stream copy — close to source size, rough)"
+            )
+            return
+
+        source_dims = getattr(self, "_first_file_dims", None)
+        per_file_mb = estimate_output_size_mb(
+            self.total_duration_seconds / max(1, len(self.input_files)), s, source_dims
+        )
+        if per_file_mb is None:
+            self.estimate_row.set_subtitle("Can't estimate for this combination")
+            return
+
+        total_mb = estimate_output_size_mb(self.total_duration_seconds, s, source_dims)
+        n = len(self.input_files)
+        if total_mb >= 1024:
+            text = f"~{total_mb / 1024:.2f} GB total ({n} file(s), rough estimate)"
+        else:
+            text = f"~{total_mb:.0f} MB total ({n} file(s), rough estimate)"
+        self.estimate_row.set_subtitle(text)
 
     def on_convert_clicked(self, _btn):
         if not self.input_files:
@@ -848,6 +1127,11 @@ class ConverterWindow(Adw.ApplicationWindow):
             dialog.connect("response", self.on_nvenc_warning_response, s)
             dialog.present()
             return
+
+        if s.use_hwaccel_decode and not self.has_nvdec:
+            # Shouldn't normally happen since the row is disabled without
+            # nvdec support, but guard against a stale/restored config.
+            s = replace(s, use_hwaccel_decode=False)
 
         self.begin_conversion(s)
 
@@ -926,7 +1210,8 @@ class ConverterWindow(Adw.ApplicationWindow):
             f"  Video: {s.video_codec} | {s.resolution} | {s.quality}",
             f"  Audio: {s.audio_codec} | {s.sample_rate}",
             f"  Output: {s.output_type}",
-            f"  GPU: {s.use_gpu}",
+            f"  GPU encode: {s.use_gpu}",
+            f"  GPU decode (NVDEC): {s.use_hwaccel_decode}",
             f"  Parallel jobs: {s.parallel_jobs}",
             "",
             "=" * 41,
@@ -957,6 +1242,29 @@ class ConverterWindow(Adw.ApplicationWindow):
 
     # ---------------- real conversion (background thread(s)) ----------------
 
+    def _run_ffmpeg(self, cmd: list[str], basename: str, file_duration: int) -> bool:
+        """Runs one ffmpeg command, streaming progress into the log. Returns
+        True on success (returncode 0), False otherwise. Does NOT raise."""
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            )
+        except FileNotFoundError:
+            return False
+
+        for line in proc.stdout:
+            if self.cancel_event.is_set():
+                proc.terminate()
+                break
+            m = re.search(r"time=([0-9:.]+)", line)
+            if m and file_duration:
+                GLib.idle_add(
+                    self.progress_status.set_label,
+                    f"{basename} → {m.group(1)} / {format_time(file_duration)}",
+                )
+        proc.wait()
+        return proc.returncode == 0
+
     def _convert_one(self, input_file: str, s: ConversionSettings) -> tuple[str, str, str]:
         """Runs in a worker thread. Returns (status, basename, message)."""
         basename = os.path.basename(input_file)
@@ -972,34 +1280,33 @@ class ConverterWindow(Adw.ApplicationWindow):
         if os.path.exists(output_file) and not s.overwrite:
             return "skipped", basename, "already exists"
 
-        cmd = build_ffmpeg_cmd(input_file, output_file, s)
         GLib.idle_add(self.append_log, f"▶ {basename}")
         GLib.idle_add(
             self.progress_status.set_label,
             f"{basename}  ·  {file_size}MB  ·  {format_time(file_duration)}",
         )
 
+        cmd = build_ffmpeg_cmd(input_file, output_file, s)
         try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-            )
-            for line in proc.stdout:
-                if self.cancel_event.is_set():
-                    proc.terminate()
-                    break
-                m = re.search(r"time=([0-9:.]+)", line)
-                if m and file_duration:
-                    GLib.idle_add(
-                        self.progress_status.set_label,
-                        f"{basename} → {m.group(1)} / {format_time(file_duration)}",
-                    )
-            proc.wait()
-            ok = proc.returncode == 0
-        except FileNotFoundError:
-            ok = False
+            ok = self._run_ffmpeg(cmd, basename, file_duration)
         except Exception as e:
             log.exception("ffmpeg failed for %s", basename)
             return "failed", basename, str(e)
+
+        used_fallback = False
+        if not ok and not self.cancel_event.is_set() and s.use_hwaccel_decode:
+            # NVDEC can fail on some inputs (unsupported profile, driver
+            # hiccup, VRAM pressure, ...). Retry once on CPU decode before
+            # giving up, so a flaky GPU path doesn't sink the whole batch.
+            GLib.idle_add(self.append_log, f"⚠ {basename}: GPU decode failed, retrying on CPU…")
+            fallback_s = replace(s, use_hwaccel_decode=False)
+            cmd = build_ffmpeg_cmd(input_file, output_file, fallback_s)
+            try:
+                ok = self._run_ffmpeg(cmd, basename, file_duration)
+                used_fallback = True
+            except Exception as e:
+                log.exception("ffmpeg CPU-decode fallback failed for %s", basename)
+                return "failed", basename, str(e)
 
         if self.cancel_event.is_set() and not ok:
             return "cancelled", basename, "Cancelled mid-conversion"
@@ -1011,6 +1318,8 @@ class ConverterWindow(Adw.ApplicationWindow):
                 msg = f"{out_size}MB — {ratio:.1f}x compression"
             else:
                 msg = f"{out_size}MB"
+            if used_fallback:
+                msg += " (CPU decode fallback)"
             return "success", basename, msg
 
         return "failed", basename, "ffmpeg returned an error"
@@ -1031,7 +1340,8 @@ class ConverterWindow(Adw.ApplicationWindow):
             "Settings:",
             f"  Video: {s.video_codec} | {s.resolution} | {s.quality}",
             f"  Audio: {s.audio_codec} | {s.sample_rate}",
-            f"  Output: {s.output_type}", f"  GPU: {s.use_gpu}",
+            f"  Output: {s.output_type}", f"  GPU encode: {s.use_gpu}",
+            f"  GPU decode (NVDEC): {s.use_hwaccel_decode}",
             f"  Parallel jobs: {s.parallel_jobs}", "",
             "=" * 41, "",
         ]
