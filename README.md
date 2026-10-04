@@ -76,6 +76,10 @@ or
 ```bash
 nix-shell -p gobject-introspection gtk4 libadwaita ffmpeg "python3.withPackages (ps: [ ps.pygobject3 ])" --run "python3 'TNixOS.py'"
 ```
+## Screenshot
+<img width="708" height="898" alt="image" src="https://github.com/user-attachments/assets/809586bc-e892-41a6-a65f-38ff3e07036f" />
+<img width="712" height="1006" alt="image" src="https://github.com/user-attachments/assets/48f28995-2de5-4792-8b8b-b87a7697162a" />
+<img width="712" height="899" alt="image" src="https://github.com/user-attachments/assets/f7536974-9f1b-4129-a7fd-9db5ba969565" />
 
 
 ## ⚠️ Caution
