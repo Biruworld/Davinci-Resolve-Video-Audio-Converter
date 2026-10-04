@@ -74,7 +74,7 @@ nix-shell -p python3 python3Packages.pygobject3 ffmpeg
 Then run the py file. Make sure you're on the directory itself.
 or
 ```bash
-nix-shell -p gobject-introspection gtk4 libadwaita ffmpeg "python3.withPackages (ps: [ ps.pygobject3 ])" --run "python3 'TNixOS.py'"
+nix-shell -p gobject-introspection gtk4 libadwaita ffmpeg "python3.withPackages (ps: [ ps.pygobject3 ])" --run "python3 'video-converter.py'"
 ```
 ## Screenshot
 <img width="708" height="898" alt="image" src="https://github.com/user-attachments/assets/809586bc-e892-41a6-a65f-38ff3e07036f" />
