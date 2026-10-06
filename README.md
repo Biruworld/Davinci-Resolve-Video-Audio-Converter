@@ -66,15 +66,40 @@ How to Run?
 ```bash
 davinci-resolve
 ```
+NixOS Flake:
+```bash
+{
+  inputs = {
+    davinci-converter.url =
+      "github:Biruworld/Davinci-Resolve-Video-Audio-Converter";
+    # ...
+  };
 
-Tips for NixOS: 
-```bash
-nix-shell -p python3 python3Packages.pygobject3 ffmpeg
+  outputs = inputs @ {
+    davinci-converter,
+    ...
+  }: {
+    nixosConfigurations.my-system = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      specialArgs = { inherit inputs; };
+
+      modules = [
+        # ...
+        ({ pkgs, ... }: {
+          environment.systemPackages = [
+            davinci-converter.packages.${pkgs.system}.default
+          ];
+        })
+      ];
+    };
+  };
+}
 ```
-Then run the py file. Make sure you're on the directory itself.
-or
+Then:
 ```bash
-nix-shell -p gobject-introspection gtk4 libadwaita ffmpeg "python3.withPackages (ps: [ ps.pygobject3 ])" --run "python3 'video-converter.py'"
+environment.systemPackages = [
+  davinci-converter.packages.${pkgs.system}.default
+];
 ```
 ## Screenshot
 <img width="708" height="898" alt="image" src="https://github.com/user-attachments/assets/809586bc-e892-41a6-a65f-38ff3e07036f" />
