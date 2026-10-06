@@ -40,9 +40,22 @@
         dontBuild = true;
 
         installPhase = ''
-          mkdir -p $out/bin
-          cp video-converter.py $out/bin/davinci-converter
-          chmod +x $out/bin/davinci-converter
+        mkdir -p $out/bin
+        mkdir -p $out/share/applications
+
+        cp video-converter.py $out/bin/davinci-converter
+        chmod +x $out/bin/davinci-converter
+
+        cat > $out/share/applications/sh.asterlusnce.davinciconverter.desktop <<EOF
+        [Desktop Entry]
+        Name=DaVinci Converter
+        Comment=Video and audio converter for DaVinci Resolve
+        Exec=davinci-converter
+        Icon=video-x-generic
+        Terminal=false
+        Type=Application
+        Categories=AudioVideo;Video;
+        EOF
         '';
 
         postFixup = ''
