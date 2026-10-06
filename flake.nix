@@ -20,7 +20,7 @@
     {
       packages.${system}.default = pkgs.stdenv.mkDerivation {
         pname = "davinci-converter";
-        version = "4.0";
+        version = "0.1.0";
 
         src = ./.;
 
